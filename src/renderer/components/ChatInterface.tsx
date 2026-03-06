@@ -86,6 +86,21 @@ const ChatInterface: React.FC<Props> = ({
     [conversations]
   );
 
+  const activeConversation = useMemo(
+    () => conversations.find((c) => c.id === activeConversationId) ?? null,
+    [conversations, activeConversationId]
+  );
+
+  const activeConvMeta = useMemo(() => {
+    try {
+      return activeConversation?.metadata ? JSON.parse(activeConversation.metadata) : null;
+    } catch {
+      return null;
+    }
+  }, [activeConversation?.metadata]);
+
+  const isTeammateConv = activeConvMeta?.type === 'teammate';
+
   // Update terminal ID to include conversation ID and agent - unique per conversation
   const terminalId = useMemo(() => {
     // Find the active conversation to check if it's the main one
@@ -708,6 +723,36 @@ const ChatInterface: React.FC<Props> = ({
     return () => window.removeEventListener('emdash:close-active-chat', handleCloseActiveChat);
   }, [activeConversationId, handleCloseChat]);
 
+  // Auto-create a tab when a teammate agent is spawned
+  useEffect(() => {
+    const handleTeammateSpawn = async (e: Event) => {
+      const ev = (e as CustomEvent).detail;
+      if (!ev || ev.taskId !== task.id) return;
+      const { agentName, tmuxSocket, paneId } = ev.payload ?? {};
+      if (!tmuxSocket || !paneId) return;
+
+      try {
+        const newConv = await rpc.db.createConversation({
+          taskId: task.id,
+          title: agentName ?? 'teammate',
+          provider: 'claude',
+          isMain: false,
+        });
+        await rpc.db.saveConversation({
+          ...newConv,
+          metadata: JSON.stringify({ type: 'teammate', tmuxSocket, paneId }),
+        });
+        const updated = await rpc.db.getConversations(task.id);
+        setConversations(updated);
+        setActiveConversationId(newConv.id);
+      } catch (err) {
+        console.error('Failed to create teammate tab:', err);
+      }
+    };
+    window.addEventListener('emdash:teammate-spawn', handleTeammateSpawn);
+    return () => window.removeEventListener('emdash:teammate-spawn', handleTeammateSpawn);
+  }, [task.id]);
+
   const isTerminal = agentMeta[agent]?.terminalOnly === true;
   const autoApproveEnabled =
     Boolean(task.metadata?.autoApprove) && Boolean(agentMeta[agent]?.autoApproveFlag);
@@ -1016,7 +1061,7 @@ const ChatInterface: React.FC<Props> = ({
                 </div>
               </div>
               {(() => {
-                if (isAgentInstalled === false) {
+                if (isAgentInstalled === false && !isTeammateConv) {
                   return (
                     <InstallBanner
                       agent={agent as any}
@@ -1074,7 +1119,8 @@ const ChatInterface: React.FC<Props> = ({
                       ? { connectionId: projectRemoteConnectionId }
                       : undefined
                   }
-                  providerId={agent}
+                  providerId={isTeammateConv ? undefined : agent}
+                  shell={isTeammateConv ? '/bin/bash' : undefined}
                   autoApprove={autoApproveEnabled}
                   env={taskEnv}
                   keepAlive={true}
@@ -1090,6 +1136,15 @@ const ChatInterface: React.FC<Props> = ({
                   }}
                   onStartSuccess={() => {
                     setCliStartError(null);
+                    // For teammate tabs: attach to the agent's tmux pane
+                    if (isTeammateConv && activeConvMeta?.tmuxSocket && activeConvMeta?.paneId) {
+                      const api = (window as any).electronAPI;
+                      api?.ptyInput?.({
+                        id: terminalId,
+                        data: `exec tmux -L ${activeConvMeta.tmuxSocket} attach-session -t ${activeConvMeta.paneId}\n`,
+                      });
+                      return;
+                    }
                     // Mark initial injection as sent so it won't re-run on restart
                     if (initialInjection && !task.metadata?.initialInjectionSent) {
                       void rpc.db.saveTask({

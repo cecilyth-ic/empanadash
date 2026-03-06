@@ -19,6 +19,11 @@ export function useAgentEvents(onEvent?: (event: AgentEvent) => void): void {
   useEffect(() => {
     const cleanup = window.electronAPI.onAgentEvent(
       (event: AgentEvent, meta: { appFocused: boolean }) => {
+        if (event.type === 'teammate_spawn') {
+          window.dispatchEvent(new CustomEvent('emdash:teammate-spawn', { detail: event }));
+          return;
+        }
+
         const sound = mapToSound(event);
         if (sound) {
           soundPlayer.play(sound, meta.appFocused);
