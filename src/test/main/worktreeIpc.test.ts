@@ -64,14 +64,7 @@ vi.mock('../../main/services/ssh/SshService', () => ({
   },
 }));
 
-vi.mock('../../main/ipc/sshIpc', () => ({
-  remoteAgentService: {
-    execute: vi.fn(),
-    close: vi.fn(),
-    closeAll: vi.fn(),
-    getChannel: vi.fn(),
-  },
-}));
+vi.mock('../../main/ipc/sshIpc', () => ({}));
 
 vi.mock('../../main/lib/logger', () => ({
   log: {
