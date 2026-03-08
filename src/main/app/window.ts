@@ -1,8 +1,30 @@
 import { BrowserWindow, app } from 'electron';
 import { join } from 'path';
+import http from 'http';
 import { isDev } from '../utils/dev';
 import { registerExternalLinkHandlers } from '../utils/externalLinks';
 import { ensureRendererServer } from './staticServer';
+
+function waitForVite(url: string, timeoutMs = 30_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const attempt = () => {
+      http
+        .get(url, (res) => {
+          res.resume();
+          resolve();
+        })
+        .on('error', () => {
+          if (Date.now() < deadline) {
+            setTimeout(attempt, 300);
+          } else {
+            reject(new Error(`Vite dev server not ready after ${timeoutMs}ms`));
+          }
+        });
+    };
+    attempt();
+  });
+}
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -35,7 +57,11 @@ export function createMainWindow(): BrowserWindow {
   });
 
   if (isDev) {
-    mainWindow.loadURL('http://localhost:3000');
+    void waitForVite('http://localhost:3000').then(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.loadURL('http://localhost:3000');
+      }
+    });
   } else {
     // Serve renderer over an HTTP origin in production so embeds work.
     const rendererRoot = join(app.getAppPath(), 'dist', 'renderer');
@@ -59,6 +85,9 @@ export function createMainWindow(): BrowserWindow {
   // Show when ready
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
+    if (isDev) {
+      mainWindow?.webContents.openDevTools();
+    }
   });
 
   // Track window focus for telemetry

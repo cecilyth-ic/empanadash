@@ -1,4 +1,4 @@
-export type AgentEventType = 'notification' | 'stop' | 'error';
+export type AgentEventType = 'notification' | 'stop' | 'error' | 'teammate_spawn';
 
 export type NotificationType =
   | 'permission_prompt'
@@ -17,6 +17,10 @@ export interface AgentEvent {
     title?: string;
     message?: string;
     lastAssistantMessage?: string;
+    // teammate_spawn fields
+    agentName?: string;
+    tmuxSocket?: string;
+    paneId?: string;
   };
 }
 

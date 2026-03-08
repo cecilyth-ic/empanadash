@@ -182,7 +182,17 @@ const DEFAULT_SETTINGS: AppSettings = {
     theme: 'system',
     taskHoverAction: 'delete',
   },
-  providerConfigs: {},
+  providerConfigs: {
+    // Enable teammate tab support by default for Claude.
+    // --teammate-mode tmux gives each spawned agent a real tmux pane that
+    // emdash can attach to. The experiment flag unlocks multi-agent teams.
+    claude: {
+      extraArgs: '--teammate-mode tmux',
+      env: {
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+      },
+    },
+  },
   terminal: {
     fontFamily: '',
     autoCopyOnSelection: false,

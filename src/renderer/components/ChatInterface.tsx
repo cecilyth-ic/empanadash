@@ -86,6 +86,21 @@ const ChatInterface: React.FC<Props> = ({
     [conversations]
   );
 
+  const activeConversation = useMemo(
+    () => conversations.find((c) => c.id === activeConversationId) ?? null,
+    [conversations, activeConversationId]
+  );
+
+  const activeConvMeta = useMemo(() => {
+    try {
+      return activeConversation?.metadata ? JSON.parse(activeConversation.metadata) : null;
+    } catch {
+      return null;
+    }
+  }, [activeConversation?.metadata]);
+
+  const isTeammateConv = activeConvMeta?.type === 'teammate';
+
   // Update terminal ID to include conversation ID and agent - unique per conversation
   const terminalId = useMemo(() => {
     // Find the active conversation to check if it's the main one
@@ -708,6 +723,59 @@ const ChatInterface: React.FC<Props> = ({
     return () => window.removeEventListener('emdash:close-active-chat', handleCloseActiveChat);
   }, [activeConversationId, handleCloseChat]);
 
+  // Auto-create a tab when a teammate agent is spawned
+  useEffect(() => {
+    const handleTeammateSpawn = async (e: Event) => {
+      const ev = (e as CustomEvent).detail;
+      if (!ev || ev.taskId !== task.id) return;
+      const { agentName, tmuxSocket, paneId } = ev.payload ?? {};
+      if (!tmuxSocket || !paneId) return;
+
+      try {
+        const meta = JSON.stringify({ type: 'teammate', tmuxSocket, paneId });
+        const newConv = await rpc.db.createConversation({
+          taskId: task.id,
+          title: agentName ?? 'teammate',
+          provider: 'claude',
+          isMain: false,
+        });
+        // Save metadata before fetching so the tab label is correct immediately
+        await rpc.db.saveConversation({ ...newConv, metadata: meta });
+        const updated = await rpc.db.getConversations(task.id);
+        // Patch the conversation inline in case the DB fetch races
+        const patched = updated.map((c) => (c.id === newConv.id ? { ...c, metadata: meta } : c));
+        setConversations(patched);
+        setActiveConversationId(newConv.id);
+      } catch (err) {
+        console.error('Failed to create teammate tab:', err);
+      }
+    };
+    window.addEventListener('emdash:teammate-spawn', handleTeammateSpawn);
+    return () => window.removeEventListener('emdash:teammate-spawn', handleTeammateSpawn);
+  }, [task.id]);
+
+  // Auto-close teammate tabs when their agent's PTY exits (i.e. the agent finished).
+  // We register per-PTY listeners for all teammate conversations so the tab closes
+  // even if it isn't the currently active one.
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onPtyExit) return;
+    const cleanups: (() => void)[] = [];
+    for (const conv of conversations) {
+      let convMeta: Record<string, unknown> | null = null;
+      try {
+        convMeta = conv.metadata ? JSON.parse(conv.metadata) : null;
+      } catch {}
+      if (convMeta?.type !== 'teammate') continue;
+      const ptyId = makePtyId(conv.provider as Agent, 'chat', conv.id);
+      const off = api.onPtyExit(ptyId, () => {
+        void handleCloseChat(conv.id);
+      });
+      if (off) cleanups.push(off as () => void);
+    }
+    return () => cleanups.forEach((fn) => fn());
+  }, [conversations, handleCloseChat]);
+
   const isTerminal = agentMeta[agent]?.terminalOnly === true;
   const autoApproveEnabled =
     Boolean(task.metadata?.autoApprove) && Boolean(agentMeta[agent]?.autoApproveFlag);
@@ -916,14 +984,51 @@ const ChatInterface: React.FC<Props> = ({
                     const config = agentConfig[convAgent as Agent];
                     const agentName = config?.name || convAgent;
                     const isBusy = busyByConversationId[conv.id] === true;
+                    const hasMultipleTabs = sortedConversations.length > 1;
+
+                    // Derive display label: main tab → "Main", teammate/custom title → conv.title,
+                    // otherwise fall back to provider name + number
+                    let convMeta: Record<string, unknown> | null = null;
+                    try {
+                      convMeta = conv.metadata ? JSON.parse(conv.metadata) : null;
+                    } catch {}
+                    const isTeammate = convMeta?.type === 'teammate';
+                    const tabLabel: string =
+                      conv.isMain && hasMultipleTabs
+                        ? 'Main'
+                        : isTeammate && conv.title
+                          ? conv.title
+                          : agentName;
 
                     // Count how many chats use the same agent up to this point
                     const sameAgentCount = sortedConversations
                       .slice(0, index + 1)
                       .filter((c) => (c.provider ?? 'claude') === convAgent).length;
                     const showNumber =
+                      !conv.isMain &&
+                      !isTeammate &&
                       sortedConversations.filter((c) => (c.provider ?? 'claude') === convAgent)
                         .length > 1;
+
+                    // For teammate tabs: number duplicates that share the same title
+                    const sameTeammateNameCount = isTeammate
+                      ? sortedConversations.slice(0, index + 1).filter((c) => {
+                          let m: Record<string, unknown> | null = null;
+                          try {
+                            m = c.metadata ? JSON.parse(c.metadata) : null;
+                          } catch {}
+                          return m?.type === 'teammate' && c.title === conv.title;
+                        }).length
+                      : 0;
+                    const showTeammateNumber =
+                      isTeammate &&
+                      sortedConversations.filter((c) => {
+                        let m: Record<string, unknown> | null = null;
+                        try {
+                          m = c.metadata ? JSON.parse(c.metadata) : null;
+                        } catch {}
+                        return m?.type === 'teammate' && c.title === conv.title;
+                      }).length > 1;
 
                     return (
                       <button
@@ -937,7 +1042,7 @@ const ChatInterface: React.FC<Props> = ({
                             ? 'bg-background text-foreground shadow-sm'
                             : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
                         )}
-                        title={`${agentName}${showNumber ? ` (${sameAgentCount})` : ''}`}
+                        title={`${agentName}${showNumber ? ` (${sameAgentCount})` : ''}${showTeammateNumber ? ` (${sameTeammateNameCount})` : ''}`}
                       >
                         {config?.logo && (
                           <AgentLogo
@@ -949,8 +1054,11 @@ const ChatInterface: React.FC<Props> = ({
                           />
                         )}
                         <span className="max-w-[10rem] truncate">
-                          {agentName}
+                          {tabLabel}
                           {showNumber && <span className="ml-1 opacity-60">{sameAgentCount}</span>}
+                          {showTeammateNumber && (
+                            <span className="ml-1 opacity-60">{sameTeammateNameCount}</span>
+                          )}
                         </span>
                         {isBusy && conversations.length > 1 ? (
                           <Spinner
@@ -1016,7 +1124,7 @@ const ChatInterface: React.FC<Props> = ({
                 </div>
               </div>
               {(() => {
-                if (isAgentInstalled === false) {
+                if (isAgentInstalled === false && !isTeammateConv) {
                   return (
                     <InstallBanner
                       agent={agent as any}
@@ -1074,7 +1182,8 @@ const ChatInterface: React.FC<Props> = ({
                       ? { connectionId: projectRemoteConnectionId }
                       : undefined
                   }
-                  providerId={agent}
+                  providerId={isTeammateConv ? undefined : agent}
+                  shell={isTeammateConv ? '/bin/bash' : undefined}
                   autoApprove={autoApproveEnabled}
                   env={taskEnv}
                   keepAlive={true}
@@ -1090,6 +1199,37 @@ const ChatInterface: React.FC<Props> = ({
                   }}
                   onStartSuccess={() => {
                     setCliStartError(null);
+                    // For teammate tabs: isolate the agent's pane in its own session then attach.
+                    // We break the pane out of any split-window layout so each emdash tab
+                    // gets a fully independent tmux session → correct input routing for
+                    // multi-agent teams where panes would otherwise fight over session focus.
+                    if (isTeammateConv && activeConvMeta?.tmuxSocket && activeConvMeta?.paneId) {
+                      const api = (window as any).electronAPI;
+                      const sock = activeConvMeta.tmuxSocket;
+                      const pane = activeConvMeta.paneId;
+                      const vsess = `emdash-${pane.replace('%', '')}`;
+                      // Each line ends with \n so bash executes them sequentially.
+                      const script =
+                        // Break pane into its own window; output: "session_name window_id"
+                        `_W=$(tmux -L "${sock}" break-pane -d -P -F '#{session_name} #{window_id}' -s "${pane}" 2>/dev/null)\n` +
+                        // If already the sole pane of its window, locate it instead
+                        `[ -z "$_W" ] && _W=$(tmux -L "${sock}" list-panes -a -F '#{session_name} #{window_id} #{pane_id}' 2>/dev/null | awk '$3=="${pane}"{print $1" "$2;exit}')\n` +
+                        `_ORIG=$(echo "$_W" | awk '{print $1}') _WIN=$(echo "$_W" | awk '{print $2}')\n` +
+                        // Safety fallback: if parsing failed, just attach directly
+                        `[ -z "$_ORIG" ] || [ -z "$_WIN" ] && exec tmux -L "${sock}" attach-session -t "${pane}"\n` +
+                        // Tear down any stale isolated session from a previous attach
+                        `tmux -L "${sock}" kill-session -t "${vsess}" 2>/dev/null\n` +
+                        // Create a fresh empty session to house only this agent's window
+                        `tmux -L "${sock}" new-session -d -s "${vsess}" 2>/dev/null\n` +
+                        // Move the agent's window into the isolated session
+                        `tmux -L "${sock}" move-window -d -s "$_ORIG:$_WIN" -t "${vsess}:" 2>/dev/null\n` +
+                        // Kill the empty placeholder window that new-session created
+                        `tmux -L "${sock}" kill-window -t "${vsess}:0" 2>/dev/null\n` +
+                        // Attach — single-pane window fills the screen naturally, no zoom needed
+                        `exec tmux -L "${sock}" attach-session -t "${vsess}"\n`;
+                      api?.ptyInput?.({ id: terminalId, data: script });
+                      return;
+                    }
                     // Mark initial injection as sent so it won't re-run on restart
                     if (initialInjection && !task.metadata?.initialInjectionSent) {
                       void rpc.db.saveTask({
