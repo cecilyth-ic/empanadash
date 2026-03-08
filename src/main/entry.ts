@@ -8,7 +8,7 @@ import path from 'node:path';
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { app } = require('electron');
-  app.setName('Emdash');
+  app.setName('empanadash');
 } catch {}
 
 // Install minimal path alias resolver without external deps.
