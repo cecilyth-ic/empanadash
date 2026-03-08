@@ -189,7 +189,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     claude: {
       extraArgs: '--teammate-mode tmux',
       env: {
-        CLAUDE_CODE_EXPERIMENT_AGENT_TEAMS: '1',
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
       },
     },
   },
