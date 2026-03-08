@@ -1122,6 +1122,12 @@ declare global {
       sshGetState: (
         connectionId: string
       ) => Promise<'connecting' | 'connected' | 'disconnected' | 'error'>;
+      sshGetAllStates: () => Promise<
+        Array<{
+          connectionId: string;
+          state: 'connecting' | 'connected' | 'disconnected' | 'error';
+        }>
+      >;
       sshGetConfig: () => Promise<{ success: boolean; hosts?: any[]; error?: string }>;
       sshGetSshConfigHost: (hostAlias: string) => Promise<{
         success: boolean;

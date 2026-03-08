@@ -14,8 +14,90 @@ export interface UseRemoteProjectResult {
   reconnect: () => Promise<void>;
 }
 
-// Connection state cache to persist across component unmounts
+// Connection state cache to persist across component unmounts.
+// Keyed by projectId for UI components, and by connectionId for the poller.
 const connectionStateCache = new Map<string, ConnectionState>();
+
+// Maps connectionId → projectId so the batch poller can update the project-keyed cache.
+const connIdToProjectId = new Map<string, string>();
+
+/**
+ * Lightweight cache reader for sidebar indicators — no polling, no side effects.
+ * Returns the last known state or 'disconnected' if unknown.
+ */
+export function getConnectionStateFromCache(projectId: string): ConnectionState {
+  return connectionStateCache.get(projectId) || 'disconnected';
+}
+
+// ---------------------------------------------------------------------------
+// Centralized batch poller — ONE interval fetches ALL connection states.
+// ---------------------------------------------------------------------------
+let batchPollerInterval: ReturnType<typeof setInterval> | null = null;
+let batchPollerSubscribers = 0;
+const batchPollerListeners = new Set<() => void>();
+
+async function batchPollStates() {
+  try {
+    const states = await window.electronAPI.sshGetAllStates();
+    if (!Array.isArray(states)) return;
+    for (const { connectionId, state } of states) {
+      const projectId = connIdToProjectId.get(connectionId);
+      if (projectId) {
+        connectionStateCache.set(projectId, state as ConnectionState);
+      }
+    }
+    // Notify subscribers so they can re-render
+    for (const listener of batchPollerListeners) {
+      listener();
+    }
+  } catch {
+    // Silently ignore — the main process may not support the new IPC yet
+  }
+}
+
+function startBatchPoller() {
+  batchPollerSubscribers++;
+  if (batchPollerSubscribers === 1 && !batchPollerInterval) {
+    batchPollStates(); // Immediate first poll
+    batchPollerInterval = setInterval(batchPollStates, 10_000);
+  }
+}
+
+function stopBatchPoller() {
+  batchPollerSubscribers = Math.max(0, batchPollerSubscribers - 1);
+  if (batchPollerSubscribers === 0 && batchPollerInterval) {
+    clearInterval(batchPollerInterval);
+    batchPollerInterval = null;
+  }
+}
+
+/**
+ * Hook for sidebar items to subscribe to cached connection state updates.
+ * Starts/stops the batch poller based on how many subscribers exist.
+ * No per-component IPC — all state comes from the shared batch poll.
+ */
+export function useConnectionStateFromCache(
+  projectId: string | null,
+  connectionId: string | null
+): ConnectionState {
+  const [, forceUpdate] = useState(0);
+
+  useEffect(() => {
+    if (!projectId || !connectionId) return;
+    connIdToProjectId.set(connectionId, projectId);
+    const listener = () => forceUpdate((n) => n + 1);
+    batchPollerListeners.add(listener);
+    startBatchPoller();
+    return () => {
+      batchPollerListeners.delete(listener);
+      stopBatchPoller();
+    };
+  }, [projectId, connectionId]);
+
+  if (!projectId) return 'disconnected';
+  return connectionStateCache.get(projectId) || 'disconnected';
+}
+
 const connectionAttempts = new Map<string, number>();
 const MAX_RETRY_ATTEMPTS = 3;
 
@@ -46,6 +128,13 @@ export function useRemoteProject(project: Project | null): UseRemoteProjectResul
   );
   const connectionId =
     project && (project as any).sshConnectionId ? (project as any).sshConnectionId : null;
+
+  // Register the connectionId→projectId mapping for the batch poller
+  useEffect(() => {
+    if (connectionId && project) {
+      connIdToProjectId.set(connectionId, project.id);
+    }
+  }, [connectionId, project]);
 
   // Update connection state and cache
   const updateConnectionState = useCallback(
@@ -194,6 +283,11 @@ export function useRemoteProject(project: Project | null): UseRemoteProjectResul
   // Reconnection is handled exclusively by the main-process
   // SshConnectionMonitor (via ssh2 keepalive + exponential backoff).
   // This effect only syncs the UI state.
+  //
+  // IMPORTANT: connectionState is intentionally NOT in the dependency array.
+  // Including it causes the interval to restart on every state change, which
+  // during connection transitions can create rapid-fire IPC calls that
+  // saturate the main process and freeze the UI.
   useEffect(() => {
     if (!isRemote || !connectionId) return;
 
@@ -201,7 +295,7 @@ export function useRemoteProject(project: Project | null): UseRemoteProjectResul
       try {
         // The API returns the state string directly
         const state = (await window.electronAPI.sshGetState(connectionId)) as ConnectionState;
-        if (isMountedRef.current && state !== connectionState) {
+        if (isMountedRef.current) {
           updateConnectionState(state);
         }
       } catch (err) {
@@ -209,20 +303,18 @@ export function useRemoteProject(project: Project | null): UseRemoteProjectResul
       }
     };
 
-    // Check immediately if connected
-    if (connectionState === 'connected') {
-      checkHealth();
-      healthCheckIntervalRef.current = setInterval(checkHealth, 10000); // Check every 10s when connected
-    } else {
-      healthCheckIntervalRef.current = setInterval(checkHealth, 5000); // Check every 5s otherwise
-    }
+    // Single fixed interval — no need to vary by state since the main
+    // process SshConnectionMonitor handles reconnection.
+    checkHealth();
+    healthCheckIntervalRef.current = setInterval(checkHealth, 10000);
 
     return () => {
       if (healthCheckIntervalRef.current) {
         clearInterval(healthCheckIntervalRef.current);
       }
     };
-  }, [isRemote, connectionId, connectionState, updateConnectionState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRemote, connectionId, updateConnectionState]);
 
   // Cleanup on unmount
   useEffect(() => {

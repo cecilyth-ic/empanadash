@@ -93,6 +93,7 @@ export const SSH_IPC_CHANNELS = {
   READ_FILE: 'ssh:readFile',
   WRITE_FILE: 'ssh:writeFile',
   GET_STATE: 'ssh:getState',
+  GET_ALL_STATES: 'ssh:getAllStates',
   ON_STATE_CHANGE: 'ssh:onStateChange',
   GET_SSH_CONFIG: 'ssh:getSshConfig',
   GET_SSH_CONFIG_HOST: 'ssh:getSshConfigHost',

@@ -195,6 +195,7 @@ describe('RemoteGitService', () => {
       mockExecuteCommand
         .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult) // mkdir succeeds
         .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch (git rev-parse)
+        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 } as ExecResult) // stale branch check — not found
         .mockResolvedValueOnce({
           stdout: '',
           stderr: 'fatal: A branch named \"test\" already exists',

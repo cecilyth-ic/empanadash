@@ -690,6 +690,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
     return (res as any).state;
   },
+  sshGetAllStates: async () => {
+    const res = await ipcRenderer.invoke('ssh:getAllStates');
+    if (res && typeof res === 'object' && 'success' in res && !res.success) {
+      throw new Error((res as any).error || 'SSH get all states failed');
+    }
+    return (res as any).states as Array<{ connectionId: string; state: string }>;
+  },
   sshGetConfig: () => ipcRenderer.invoke('ssh:getSshConfig'),
   sshGetSshConfigHost: (hostAlias: string) => ipcRenderer.invoke('ssh:getSshConfigHost', hostAlias),
   sshCheckIsGitRepo: async (connectionId: string, remotePath: string) => {
@@ -1172,6 +1179,7 @@ export interface ElectronAPI {
   sshReadFile: (connectionId: string, path: string) => Promise<string>;
   sshWriteFile: (connectionId: string, path: string, content: string) => Promise<void>;
   sshGetState: (connectionId: string) => Promise<any>;
+  sshGetAllStates: () => Promise<Array<{ connectionId: string; state: string }>>;
   sshGetConfig: () => Promise<{ success: boolean; hosts?: any[]; error?: string }>;
 }
 
