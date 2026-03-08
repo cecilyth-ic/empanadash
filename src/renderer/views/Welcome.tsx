@@ -1,5 +1,4 @@
-import IconLight from '../../assets/images/emdash/icon-light.png';
-import YTBanner from '../../assets/images/ytbanner.png';
+import mascot from '../../assets/images/empanadash/mascot.png';
 import { Button } from '@/components/ui/button';
 import { motion, type Variants } from 'framer-motion';
 import { useTheme } from '@/hooks/useTheme';
@@ -36,32 +35,14 @@ export function WelcomeScreen({ onGetStarted }: WelcomeScreenProps) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
-      <div className="absolute bottom-0 left-0 right-0 h-3/5">
-        <div
-          className="absolute inset-0 opacity-40"
-          style={{
-            backgroundImage: `url(${YTBanner})`,
-            backgroundSize: 'cover',
-            backgroundPosition: 'center top',
-            maskImage:
-              'linear-gradient(to bottom, transparent 0%, transparent 30%, rgba(0,0,0,0.4) 60%, rgba(0,0,0,0.8) 100%)',
-            WebkitMaskImage:
-              'linear-gradient(to bottom, transparent 0%, transparent 30%, rgba(0,0,0,0.4) 60%, rgba(0,0,0,0.8) 100%)',
-          }}
-        />
-      </div>
-
       <motion.div
         className="relative z-10 flex flex-col items-center justify-center space-y-4 p-8"
         variants={containerVariants}
         initial="hidden"
         animate="visible"
       >
-        <motion.div
-          className="rounded-md border border-border/40 bg-white p-1.5 shadow-lg shadow-black/5 ring-1 ring-black/5 dark:shadow-white/5 dark:ring-white/10"
-          variants={itemVariants}
-        >
-          <img src={IconLight} alt="Emdash" className="h-12 w-12 rounded-sm" />
+        <motion.div variants={itemVariants}>
+          <img src={mascot} alt="empanadash" className="h-24 w-24" />
         </motion.div>
 
         <motion.h1
