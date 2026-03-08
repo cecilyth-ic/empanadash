@@ -85,6 +85,9 @@ export function createMainWindow(): BrowserWindow {
   // Show when ready
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
+    if (isDev) {
+      mainWindow?.webContents.openDevTools();
+    }
   });
 
   // Track window focus for telemetry
