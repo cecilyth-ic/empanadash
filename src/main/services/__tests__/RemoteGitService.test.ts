@@ -41,7 +41,7 @@ describe('RemoteGitService', () => {
       expect(result.files).toHaveLength(0);
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
-        'git status --porcelain -b',
+        'GIT_OPTIONAL_LOCKS=0 git status --porcelain -b --no-renames',
         '/home/user/project'
       );
     });
@@ -124,20 +124,20 @@ describe('RemoteGitService', () => {
 
     it('should create worktree with default base ref', async () => {
       mockExecuteCommand.mockResolvedValue({
-        stdout: "Preparing worktree (new branch 'task-name-1705314600000')\n",
+        stdout: '',
         stderr: '',
         exitCode: 0,
       } as ExecResult);
 
       const result = await service.createWorktree('conn-1', '/home/user/project', 'task name');
 
+      // getDefaultBranch: single batched script
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
-        'mkdir -p .emdash/worktrees',
+        expect.stringContaining('git rev-parse --abbrev-ref HEAD'),
         '/home/user/project'
       );
-      // When no baseRef is provided, getDefaultBranch is called first (git rev-parse),
-      // then git worktree add is called
+      // createWorktree: single batched script with mkdir + worktree add + sparse-checkout
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
         expect.stringContaining('git worktree add'),
@@ -162,8 +162,8 @@ describe('RemoteGitService', () => {
         'origin/develop'
       );
 
-      expect(mockExecuteCommand).toHaveBeenNthCalledWith(
-        2,
+      // Batch script should include the custom base ref
+      expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
         expect.stringContaining('origin/develop'),
         '/home/user/project'
@@ -193,14 +193,12 @@ describe('RemoteGitService', () => {
 
     it('should throw error when worktree creation fails', async () => {
       mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult) // mkdir succeeds
-        .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch (git rev-parse)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 } as ExecResult) // stale branch check — not found
+        .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch (batched)
         .mockResolvedValueOnce({
-          stdout: '',
-          stderr: 'fatal: A branch named \"test\" already exists',
+          stdout: 'fatal: A branch named "test" already exists',
+          stderr: '',
           exitCode: 128,
-        } as ExecResult); // git worktree add fails
+        } as ExecResult); // batched create script fails
 
       await expect(service.createWorktree('conn-1', '/home/user/project', 'test')).rejects.toThrow(
         'Failed to create worktree: fatal: A branch named'
@@ -239,17 +237,18 @@ describe('RemoteGitService', () => {
         '/home/user/project/.emdash/worktrees/test-123'
       );
 
+      // Batched: remove + prune in a single command
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
-        "git worktree remove '/home/user/project/.emdash/worktrees/test-123' --force",
+        "git worktree remove '/home/user/project/.emdash/worktrees/test-123' --force && git worktree prune",
         '/home/user/project'
       );
     });
 
     it('should throw error when removal fails', async () => {
       mockExecuteCommand.mockResolvedValue({
-        stdout: '',
-        stderr: 'fatal: not a valid worktree',
+        stdout: 'fatal: not a valid worktree',
+        stderr: '',
         exitCode: 128,
       } as ExecResult);
 
@@ -273,8 +272,29 @@ describe('RemoteGitService', () => {
 
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
-        "git worktree remove '/home/user/my project/.emdash/worktrees/test' --force",
+        "git worktree remove '/home/user/my project/.emdash/worktrees/test' --force && git worktree prune",
         '/home/user/my project'
+      );
+    });
+
+    it('should include branch deletion when branch provided', async () => {
+      mockExecuteCommand.mockResolvedValue({
+        stdout: '',
+        stderr: '',
+        exitCode: 0,
+      } as ExecResult);
+
+      await service.removeWorktree(
+        'conn-1',
+        '/home/user/project',
+        '/home/user/project/.emdash/worktrees/test-123',
+        'test-branch'
+      );
+
+      expect(mockExecuteCommand).toHaveBeenCalledWith(
+        'conn-1',
+        expect.stringContaining("git branch -D 'test-branch'"),
+        '/home/user/project'
       );
     });
   });
@@ -443,11 +463,13 @@ describe('RemoteGitService', () => {
   });
 
   describe('getStatusDetailed', () => {
+    const SEP = '<<__EMDASH_SEP__>>';
+
     it('should return empty array for non-git directory', async () => {
       mockExecuteCommand.mockResolvedValue({
-        stdout: '',
-        stderr: 'fatal: not a git repository',
-        exitCode: 128,
+        stdout: '__NOT_GIT__',
+        stderr: '',
+        exitCode: 0,
       } as ExecResult);
 
       const result = await service.getStatusDetailed('conn-1', '/home/user/project');
@@ -455,32 +477,30 @@ describe('RemoteGitService', () => {
     });
 
     it('should return empty array for clean repo', async () => {
-      mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: 'true', stderr: '', exitCode: 0 } as ExecResult) // rev-parse
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult); // status
+      mockExecuteCommand.mockResolvedValueOnce({
+        stdout: `\n${SEP}\n\n${SEP}\n`,
+        stderr: '',
+        exitCode: 0,
+      } as ExecResult);
 
       const result = await service.getStatusDetailed('conn-1', '/home/user/project');
       expect(result).toEqual([]);
     });
 
     it('should parse status with additions/deletions from numstat', async () => {
-      mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: 'true', stderr: '', exitCode: 0 } as ExecResult) // rev-parse
-        .mockResolvedValueOnce({
-          stdout: ' M src/app.ts\nA  src/new.ts\n?? untracked.txt\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult) // status
-        .mockResolvedValueOnce({
-          stdout: '5\t2\tsrc/new.ts\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult) // numstat --cached
-        .mockResolvedValueOnce({
-          stdout: '10\t3\tsrc/app.ts\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult); // numstat (unstaged)
+      mockExecuteCommand.mockResolvedValueOnce({
+        stdout: [
+          ' M src/app.ts',
+          'A  src/new.ts',
+          '?? untracked.txt',
+          SEP,
+          '5\t2\tsrc/new.ts',
+          SEP,
+          '10\t3\tsrc/app.ts',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      } as ExecResult);
 
       const result = await service.getStatusDetailed('conn-1', '/home/user/project');
 
@@ -508,14 +528,11 @@ describe('RemoteGitService', () => {
 
     it('should batch line-count for untracked files', async () => {
       mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: 'true', stderr: '', exitCode: 0 } as ExecResult) // rev-parse
         .mockResolvedValueOnce({
-          stdout: '?? file1.txt\n?? file2.txt\n',
+          stdout: [`?? file1.txt`, `?? file2.txt`, SEP, '', SEP, ''].join('\n'),
           stderr: '',
           exitCode: 0,
-        } as ExecResult) // status
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult) // numstat --cached
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult) // numstat
+        } as ExecResult) // batched status + numstat
         .mockResolvedValueOnce({
           stdout: '42\n100\n',
           stderr: '',
@@ -530,15 +547,11 @@ describe('RemoteGitService', () => {
     });
 
     it('should handle renamed files', async () => {
-      mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: 'true', stderr: '', exitCode: 0 } as ExecResult)
-        .mockResolvedValueOnce({
-          stdout: 'R  old.ts -> new.ts\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult);
+      mockExecuteCommand.mockResolvedValueOnce({
+        stdout: [`R  old.ts -> new.ts`, SEP, '', SEP, ''].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      } as ExecResult);
 
       const result = await service.getStatusDetailed('conn-1', '/home/user/project');
 
@@ -879,19 +892,12 @@ describe('RemoteGitService', () => {
 
   describe('getBranchStatus', () => {
     it('should return branch status with ahead/behind', async () => {
-      mockExecuteCommand
-        .mockResolvedValueOnce({
-          stdout: 'feature-branch\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult) // branch --show-current
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 } as ExecResult) // gh fails
-        .mockResolvedValueOnce({ stdout: 'main\n', stderr: '', exitCode: 0 } as ExecResult) // remote show origin
-        .mockResolvedValueOnce({
-          stdout: '3\t5\n',
-          stderr: '',
-          exitCode: 0,
-        } as ExecResult); // rev-list
+      // Single batched script returns: branch, defaultBranch, ahead/behind
+      mockExecuteCommand.mockResolvedValueOnce({
+        stdout: 'feature-branch\nmain\n3\t5\n',
+        stderr: '',
+        exitCode: 0,
+      } as ExecResult);
 
       const result = await service.getBranchStatus('conn-1', '/home/user/project');
 
@@ -948,10 +954,18 @@ describe('RemoteGitService', () => {
 
   describe('execGh and execGit', () => {
     it('should run gh commands with correct cwd', async () => {
-      mockExecuteCommand.mockResolvedValue({ stdout: '{}', stderr: '', exitCode: 0 } as ExecResult);
+      // First call is the `command -v gh` probe, second is the actual gh command
+      mockExecuteCommand
+        .mockResolvedValueOnce({ stdout: 'yes\n', stderr: '', exitCode: 0 } as ExecResult)
+        .mockResolvedValueOnce({ stdout: '{}', stderr: '', exitCode: 0 } as ExecResult);
 
       await service.execGh('conn-1', '/home/user/project', 'pr view --json number');
 
+      expect(mockExecuteCommand).toHaveBeenCalledWith(
+        'conn-1',
+        'command -v gh >/dev/null 2>&1 && echo yes || echo no',
+        '/home/user/project'
+      );
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
         'gh pr view --json number',
@@ -973,11 +987,20 @@ describe('RemoteGitService', () => {
   });
 
   describe('integration scenarios', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2024-01-15T10:30:00Z'));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it('should handle full workflow: create, check status, commit, remove', async () => {
-      // Create worktree
+      // Create worktree (getDefaultBranch batched + create batched = 2 calls)
       mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult) // mkdir
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult); // worktree add
+        .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch
+        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as ExecResult); // create batch
 
       const worktree = await service.createWorktree('conn-1', '/home/user/project', 'feature');
 

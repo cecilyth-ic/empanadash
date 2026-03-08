@@ -59,6 +59,17 @@ vi.mock('../../main/services/RemoteGitService', () => ({
 vi.mock('../../main/services/ssh/SshService', () => ({
   sshService: {
     executeCommand: vi.fn(),
+    on: vi.fn(),
+    getClient: vi.fn(),
+  },
+}));
+
+vi.mock('../../main/ipc/sshIpc', () => ({
+  remoteAgentService: {
+    execute: vi.fn(),
+    close: vi.fn(),
+    closeAll: vi.fn(),
+    getChannel: vi.fn(),
   },
 }));
 

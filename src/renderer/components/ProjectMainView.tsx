@@ -109,7 +109,9 @@ function TaskRow({
   const isRunning = useTaskBusy(ws.id);
   const [isDeleting, setIsDeleting] = useState(false);
   const { pr } = usePrStatus(ws.path, enablePrStatus);
-  const { totalAdditions, totalDeletions, isLoading } = useTaskChanges(ws.path, ws.id);
+  const { totalAdditions, totalDeletions, isLoading } = useTaskChanges(ws.path, ws.id, {
+    isActive: active,
+  });
   const agentInfo = useTaskAgentNames(ws.id, ws.agentId);
 
   const handleRowClick = () => {
@@ -535,6 +537,12 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
 
       setIsCheckingDeleteRisks(true);
       try {
+        // If user already acknowledged risks, skip the re-scan and proceed
+        if (acknowledgeDirtyDelete) {
+          await handleBulkDelete();
+          return;
+        }
+
         const now = Date.now();
         const needsForceRefresh = deleteRiskTargets.some((target) => {
           const status = deleteStatus[target.id];
@@ -552,7 +560,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
         setRequiresDeleteAcknowledge(hasRisks);
         setShowDeleteWarnings(hasRisks);
 
-        if (hasRisks && !acknowledgeDirtyDelete) {
+        if (hasRisks) {
           return;
         }
 

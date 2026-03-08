@@ -309,6 +309,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                                     >
                                       <TaskItem
                                         task={task}
+                                        isActive={isActive}
                                         showDelete={true}
                                         showDirectBadge={false}
                                         isPinned={!!task.metadata?.isPinned}

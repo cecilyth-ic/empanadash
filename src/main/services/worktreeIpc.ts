@@ -9,7 +9,6 @@ import crypto from 'crypto';
 import { RemoteGitService } from './RemoteGitService';
 import { sshService } from './ssh/SshService';
 import { log } from '../lib/logger';
-import { quoteShellArg } from '../utils/shellEscape';
 import {
   isRemoteProject,
   resolveRemoteProjectForWorktreePath,
@@ -58,23 +57,36 @@ export function registerWorktreeIpc(): void {
         baseRef?: string;
       }
     ) => {
+      const ipcStart = Date.now();
+      log.info('[worktreeIpc] worktree:create called', {
+        taskName: args.taskName,
+        projectId: args.projectId,
+      });
       try {
         const project = await resolveProjectByIdOrPath({
           projectId: args.projectId,
           projectPath: args.projectPath,
         });
+        log.info(
+          `[worktreeIpc] worktree:create resolveProject took ${Date.now() - ipcStart}ms, isRemote=${isRemoteProject(project)}`
+        );
 
         if (isRemoteProject(project)) {
           const baseRef = args.baseRef ?? project.gitInfo.baseRef;
-          log.info('worktree:create (remote)', {
+          log.info('[worktreeIpc] worktree:create (remote) starting createWorktree', {
             projectId: project.id,
             remotePath: project.remotePath,
+            baseRef,
           });
+          const createStart = Date.now();
           const remote = await remoteGitService.createWorktree(
             project.sshConnectionId,
             project.remotePath,
             args.taskName,
             baseRef
+          );
+          log.info(
+            `[worktreeIpc] worktree:create (remote) createWorktree completed in ${Date.now() - createStart}ms`
           );
           const worktree = {
             id: stableIdFromRemotePath(remote.path),
@@ -85,6 +97,7 @@ export function registerWorktreeIpc(): void {
             status: 'active' as const,
             createdAt: new Date().toISOString(),
           };
+          log.info(`[worktreeIpc] worktree:create total: ${Date.now() - ipcStart}ms`);
           return { success: true, worktree };
         }
 
@@ -94,9 +107,13 @@ export function registerWorktreeIpc(): void {
           args.projectId,
           args.baseRef
         );
+        log.info(`[worktreeIpc] worktree:create (local) total: ${Date.now() - ipcStart}ms`);
         return { success: true, worktree };
       } catch (error) {
-        console.error('Failed to create worktree:', error);
+        log.error(
+          `[worktreeIpc] worktree:create FAILED after ${Date.now() - ipcStart}ms:`,
+          error as Error
+        );
         return { success: false, error: (error as Error).message };
       }
     }
@@ -104,6 +121,8 @@ export function registerWorktreeIpc(): void {
 
   // List worktrees for a project
   ipcMain.handle('worktree:list', async (event, args: { projectPath: string }) => {
+    const listStart = Date.now();
+    log.info('[worktreeIpc] worktree:list called', { projectPath: args.projectPath });
     try {
       const project = await resolveProjectByIdOrPath({ projectPath: args.projectPath });
       if (isRemoteProject(project)) {
@@ -123,13 +142,20 @@ export function registerWorktreeIpc(): void {
             createdAt: new Date().toISOString(),
           };
         });
+        log.info(
+          `[worktreeIpc] worktree:list (remote) completed in ${Date.now() - listStart}ms, count=${worktrees.length}`
+        );
         return { success: true, worktrees };
       }
 
       const worktrees = await worktreeService.listWorktrees(args.projectPath);
+      log.info(`[worktreeIpc] worktree:list (local) completed in ${Date.now() - listStart}ms`);
       return { success: true, worktrees };
     } catch (error) {
-      console.error('Failed to list worktrees:', error);
+      log.error(
+        `[worktreeIpc] worktree:list FAILED after ${Date.now() - listStart}ms:`,
+        error as Error
+      );
       return { success: false, error: (error as Error).message };
     }
   });
@@ -158,28 +184,13 @@ export function registerWorktreeIpc(): void {
             remotePath: project.remotePath,
             worktreePath: pathToRemove,
           });
+          // Single batched call: remove + prune + branch delete
           await remoteGitService.removeWorktree(
             project.sshConnectionId,
             project.remotePath,
-            pathToRemove
+            pathToRemove,
+            args.branch
           );
-          // Best-effort prune to clear stale metadata.
-          try {
-            await sshService.executeCommand(
-              project.sshConnectionId,
-              'git worktree prune --verbose',
-              project.remotePath
-            );
-          } catch {}
-          if (args.branch) {
-            try {
-              await sshService.executeCommand(
-                project.sshConnectionId,
-                `git branch -D ${quoteShellArg(args.branch)}`,
-                project.remotePath
-              );
-            } catch {}
-          }
           return { success: true };
         }
 
@@ -199,6 +210,8 @@ export function registerWorktreeIpc(): void {
 
   // Get worktree status
   ipcMain.handle('worktree:status', async (event, args: { worktreePath: string }) => {
+    const statusStart = Date.now();
+    log.info('[worktreeIpc] worktree:status called', { worktreePath: args.worktreePath });
     try {
       const remoteProject = await resolveRemoteProjectForWorktreePath(args.worktreePath);
       if (remoteProject) {
@@ -206,13 +219,20 @@ export function registerWorktreeIpc(): void {
           remoteProject.sshConnectionId,
           args.worktreePath
         );
+        log.info(
+          `[worktreeIpc] worktree:status (remote) completed in ${Date.now() - statusStart}ms`
+        );
         return { success: true, status };
       }
 
       const status = await worktreeService.getWorktreeStatus(args.worktreePath);
+      log.info(`[worktreeIpc] worktree:status (local) completed in ${Date.now() - statusStart}ms`);
       return { success: true, status };
     } catch (error) {
-      console.error('Failed to get worktree status:', error);
+      log.error(
+        `[worktreeIpc] worktree:status FAILED after ${Date.now() - statusStart}ms:`,
+        error as Error
+      );
       return { success: false, error: (error as Error).message };
     }
   });

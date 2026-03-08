@@ -180,6 +180,10 @@ function seedIssueContext(
 // Throws on unrecoverable errors; returns a warning string for soft failures.
 // ---------------------------------------------------------------------------
 export async function createTask(params: CreateTaskParams): Promise<CreateTaskResult> {
+  const createStart = performance.now();
+  console.log(
+    `[taskCreation] createTask START: task="${params.taskName}" useWorktree=${params.useWorktree} baseRef=${params.baseRef}`
+  );
   const {
     project,
     taskName,
@@ -373,6 +377,9 @@ export async function createTask(params: CreateTaskParams): Promise<CreateTaskRe
   let warning: string | undefined;
 
   if (useWorktree) {
+    console.log(
+      `[taskCreation] trying claimReserveAndSaveTask (elapsed ${(performance.now() - createStart).toFixed(0)}ms)`
+    );
     const claimAndSaveResult = await window.electronAPI.worktreeClaimReserveAndSaveTask({
       projectId: project.id,
       projectPath: project.path,
@@ -388,6 +395,9 @@ export async function createTask(params: CreateTaskParams): Promise<CreateTaskRe
       },
     });
 
+    console.log(
+      `[taskCreation] claimReserveAndSaveTask returned: success=${claimAndSaveResult.success} (elapsed ${(performance.now() - createStart).toFixed(0)}ms)`
+    );
     if (claimAndSaveResult.success && claimAndSaveResult.worktree) {
       const worktree = claimAndSaveResult.worktree;
       branch = worktree.branch;
@@ -398,12 +408,18 @@ export async function createTask(params: CreateTaskParams): Promise<CreateTaskRe
         warning = `Could not switch to ${baseRef}. Task created on default branch.`;
       }
     } else {
+      console.log(
+        `[taskCreation] claimReserve failed, falling back to worktreeCreate (elapsed ${(performance.now() - createStart).toFixed(0)}ms)`
+      );
       const worktreeResult = await window.electronAPI.worktreeCreate({
         projectPath: project.path,
         taskName,
         projectId: project.id,
         baseRef,
       });
+      console.log(
+        `[taskCreation] worktreeCreate returned: success=${worktreeResult.success} (elapsed ${(performance.now() - createStart).toFixed(0)}ms)`
+      );
       if (!worktreeResult.success) {
         throw new Error(worktreeResult.error || 'Failed to create worktree');
       }
@@ -430,6 +446,9 @@ export async function createTask(params: CreateTaskParams): Promise<CreateTaskRe
     useWorktree,
   };
 
+  console.log(
+    `[taskCreation] worktree created, saving task to DB (elapsed ${(performance.now() - createStart).toFixed(0)}ms)`
+  );
   if (!taskPersistedInClaim) {
     try {
       await rpc.db.saveTask({
@@ -459,5 +478,8 @@ export async function createTask(params: CreateTaskParams): Promise<CreateTaskRe
   });
   seedIssueContext(newTask.id, taskMetadata, newTask.agentId || primaryAgent);
 
+  console.log(
+    `[taskCreation] createTask COMPLETE in ${(performance.now() - createStart).toFixed(0)}ms: taskId=${newTask.id}`
+  );
   return { task: newTask, warning };
 }

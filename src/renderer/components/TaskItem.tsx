@@ -52,6 +52,7 @@ interface Task {
 
 interface TaskItemProps {
   task: Task;
+  isActive?: boolean;
   onDelete?: () => void | Promise<void | boolean>;
   onArchive?: () => void | Promise<void | boolean>;
   onRename?: (newName: string) => void | Promise<void>;
@@ -64,6 +65,7 @@ interface TaskItemProps {
 
 export const TaskItem: React.FC<TaskItemProps> = ({
   task,
+  isActive,
   onDelete,
   onArchive,
   onRename,
@@ -73,7 +75,9 @@ export const TaskItem: React.FC<TaskItemProps> = ({
   showDirectBadge = true,
   primaryAction = 'delete',
 }) => {
-  const { totalAdditions, totalDeletions, isLoading } = useTaskChanges(task.path, task.id);
+  const { totalAdditions, totalDeletions, isLoading } = useTaskChanges(task.path, task.id, {
+    isActive,
+  });
   const { pr } = usePrStatus(task.path);
   const isRunning = useTaskBusy(task.id);
 

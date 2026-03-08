@@ -4,6 +4,58 @@ import { quoteShellArg } from '../utils/shellEscape';
 import type { GitChange } from './GitService';
 import { parseDiffLines, stripTrailingNewline, MAX_DIFF_CONTENT_BYTES } from '../utils/diffParser';
 import type { DiffLine, DiffResult } from '../utils/diffParser';
+import { log } from '../lib/logger';
+import { getDrizzleClient } from '../db/drizzleClient';
+import { sshConnections as sshConnectionsTable } from '../db/schema';
+import { eq } from 'drizzle-orm';
+
+// ---------------------------------------------------------------------------
+// Per-connection concurrency limiter — caps concurrent SSH channels to avoid
+// MaxSessions exhaustion while still allowing parallel execution.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT_PER_CONNECTION = 8;
+
+type QueueEntry = { run: () => void };
+
+class ConnectionLimiter {
+  private running = 0;
+  private queue: QueueEntry[] = [];
+
+  limit<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const run = () => {
+        this.running++;
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            this.running--;
+            this.next();
+          });
+      };
+      if (this.running < MAX_CONCURRENT_PER_CONNECTION) {
+        run();
+      } else {
+        this.queue.push({ run });
+      }
+    });
+  }
+
+  private next(): void {
+    const entry = this.queue.shift();
+    if (entry) entry.run();
+  }
+}
+
+const limiters = new Map<string, ConnectionLimiter>();
+
+function getLimiter(connectionId: string): ConnectionLimiter {
+  let limiter = limiters.get(connectionId);
+  if (!limiter) {
+    limiter = new ConnectionLimiter();
+    limiters.set(connectionId, limiter);
+  }
+  return limiter;
+}
 
 export interface WorktreeInfo {
   path: string;
@@ -46,15 +98,102 @@ export class RemoteGitService {
 
   constructor(private sshService: SshService) {}
 
+  /**
+   * Try to reconnect an SSH connection by loading its config from the DB.
+   * Returns true if reconnected successfully.
+   */
+  private async tryReconnect(connectionId: string): Promise<boolean> {
+    try {
+      const { db } = await getDrizzleClient();
+      const rows = await db
+        .select()
+        .from(sshConnectionsTable)
+        .where(eq(sshConnectionsTable.id, connectionId))
+        .limit(1);
+      const row = rows[0];
+      if (!row) return false;
+
+      log.info(`[RemoteGitService] attempting auto-reconnect for ${connectionId}`);
+      await this.sshService.connect({
+        id: row.id,
+        name: row.name,
+        host: row.host,
+        port: row.port,
+        username: row.username,
+        authType: row.authType as 'password' | 'key' | 'agent',
+        privateKeyPath: row.privateKeyPath ?? undefined,
+        useAgent: row.useAgent === 1,
+      });
+      log.info(`[RemoteGitService] auto-reconnect succeeded for ${connectionId}`);
+      return true;
+    } catch (err) {
+      log.warn(
+        `[RemoteGitService] auto-reconnect failed for ${connectionId}: ${err instanceof Error ? err.message : err}`
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Execute a command through sshService with per-connection concurrency limiting.
+   * At most MAX_CONCURRENT_PER_CONNECTION channels are open simultaneously per connection,
+   * preventing MaxSessions exhaustion while still allowing parallel execution.
+   * Auto-reconnects once if the connection is not found.
+   */
+  private async exec(connectionId: string, command: string, cwd?: string): Promise<ExecResult> {
+    const cmdPreview = command.slice(0, 100).replace(/\n/g, '\\n');
+    log.info(`[RemoteGitService] exec: "${cmdPreview}..."`);
+    const start = Date.now();
+    const limiter = getLimiter(connectionId);
+
+    try {
+      const result = await limiter.limit(() =>
+        this.sshService.executeCommand(connectionId, command, cwd)
+      );
+      log.info(
+        `[RemoteGitService] exec completed in ${Date.now() - start}ms: "${cmdPreview}..." exitCode=${result.exitCode}`
+      );
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // Auto-reconnect once if connection is not found
+      if (msg.includes('not found')) {
+        const reconnected = await this.tryReconnect(connectionId);
+        if (reconnected) {
+          try {
+            const result = await limiter.limit(() =>
+              this.sshService.executeCommand(connectionId, command, cwd)
+            );
+            log.info(
+              `[RemoteGitService] exec completed (after reconnect) in ${Date.now() - start}ms: "${cmdPreview}..." exitCode=${result.exitCode}`
+            );
+            return result;
+          } catch (retryErr) {
+            log.warn(
+              `[RemoteGitService] exec FAILED (after reconnect) in ${Date.now() - start}ms: "${cmdPreview}..." error=${retryErr instanceof Error ? retryErr.message : retryErr}`
+            );
+            throw retryErr;
+          }
+        }
+      }
+
+      log.warn(
+        `[RemoteGitService] exec FAILED in ${Date.now() - start}ms: "${cmdPreview}..." error=${msg}`
+      );
+      throw err;
+    }
+  }
+
   private normalizeRemotePath(p: string): string {
     // Remote paths should use forward slashes.
     return p.replace(/\\/g, '/').replace(/\/+$/g, '');
   }
 
   async getStatus(connectionId: string, worktreePath: string): Promise<GitStatus> {
-    const result = await this.sshService.executeCommand(
+    const result = await this.exec(
       connectionId,
-      'git status --porcelain -b',
+      'GIT_OPTIONAL_LOCKS=0 git status --porcelain -b --no-renames',
       worktreePath
     );
 
@@ -80,37 +219,20 @@ export class RemoteGitService {
   }
 
   async getDefaultBranch(connectionId: string, projectPath: string): Promise<string> {
-    const normalizedProjectPath = this.normalizeRemotePath(projectPath);
+    const cwd = this.normalizeRemotePath(projectPath);
 
-    // Try to get the current branch
-    const currentBranchResult = await this.sshService.executeCommand(
-      connectionId,
-      'git rev-parse --abbrev-ref HEAD',
-      normalizedProjectPath
-    );
+    // Single script: try current branch, then common names
+    const script = [
+      'b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)',
+      'if [ -n "$b" ] && [ "$b" != "HEAD" ]; then echo "$b"; exit 0; fi',
+      'for name in main master develop trunk; do',
+      '  if git rev-parse --verify "$name" >/dev/null 2>&1; then echo "$name"; exit 0; fi',
+      'done',
+      'echo HEAD',
+    ].join('; ');
 
-    if (
-      currentBranchResult.exitCode === 0 &&
-      currentBranchResult.stdout.trim() &&
-      currentBranchResult.stdout.trim() !== 'HEAD'
-    ) {
-      return currentBranchResult.stdout.trim();
-    }
-
-    // Fallback: check common default branch names
-    const commonBranches = ['main', 'master', 'develop', 'trunk'];
-    for (const branch of commonBranches) {
-      const checkResult = await this.sshService.executeCommand(
-        connectionId,
-        `git rev-parse --verify ${quoteShellArg(branch)} 2>/dev/null`,
-        normalizedProjectPath
-      );
-      if (checkResult.exitCode === 0) {
-        return branch;
-      }
-    }
-
-    return 'HEAD';
+    const result = await this.exec(connectionId, script, cwd);
+    return (result.stdout || 'HEAD').trim();
   }
 
   async createWorktree(
@@ -132,6 +254,8 @@ export class RemoteGitService {
     taskName: string,
     baseRef?: string
   ): Promise<WorktreeInfo> {
+    const implStart = Date.now();
+    log.info(`[RemoteGitService] _createWorktreeImpl start: task=${taskName}, baseRef=${baseRef}`);
     const normalizedProjectPath = this.normalizeRemotePath(projectPath);
     const slug = taskName
       .toLowerCase()
@@ -142,86 +266,63 @@ export class RemoteGitService {
     const relWorktreePath = `.emdash/worktrees/${worktreeName}`;
     const worktreePath = `${normalizedProjectPath}/${relWorktreePath}`.replace(/\/+/g, '/');
 
-    // Create worktrees directory (relative so we avoid quoting issues)
-    await this.sshService.executeCommand(
-      connectionId,
-      'mkdir -p .emdash/worktrees',
-      normalizedProjectPath
-    );
-
-    // Auto-detect default branch if baseRef is not provided or is invalid
+    // Determine base ref with one round trip (or zero if provided and valid)
     let base = (baseRef || '').trim();
-
-    // If no base provided, use auto-detection
-    if (!base) {
-      base = await this.getDefaultBranch(connectionId, normalizedProjectPath);
-    } else {
-      // Always verify the provided branch exists, regardless of what it is
-      const verifyResult = await this.sshService.executeCommand(
+    log.info(`[RemoteGitService] _createWorktreeImpl: verifying base ref "${base}"`);
+    if (base) {
+      const verifyResult = await this.exec(
         connectionId,
         `git rev-parse --verify ${quoteShellArg(base)} 2>/dev/null`,
         normalizedProjectPath
       );
-
       if (verifyResult.exitCode !== 0) {
-        // Branch doesn't exist, auto-detect the actual default branch
-        base = await this.getDefaultBranch(connectionId, normalizedProjectPath);
+        base = '';
       }
     }
-
+    if (!base) {
+      log.info('[RemoteGitService] _createWorktreeImpl: fetching default branch');
+      base = await this.getDefaultBranch(connectionId, normalizedProjectPath);
+    }
     if (!base) {
       base = 'HEAD';
     }
-
-    // Clean up any stale branch/worktree from a previous failed attempt
-    const checkBranch = await this.sshService.executeCommand(
-      connectionId,
-      `git rev-parse --verify refs/heads/${quoteShellArg(worktreeName)} 2>/dev/null`,
-      normalizedProjectPath
+    log.info(
+      `[RemoteGitService] _createWorktreeImpl: using base="${base}" (elapsed ${Date.now() - implStart}ms)`
     );
-    if (checkBranch.exitCode === 0) {
-      // Branch exists from a prior failed attempt.
-      // Remove the worktree directory first — git branch -D refuses to delete
-      // a branch that's checked out in any worktree (even a stale one).
-      await this.sshService.executeCommand(
-        connectionId,
-        `rm -rf ${quoteShellArg(relWorktreePath)}`,
-        normalizedProjectPath
-      );
-      await this.sshService.executeCommand(
-        connectionId,
-        'git worktree prune',
-        normalizedProjectPath
-      );
-      await this.sshService.executeCommand(
-        connectionId,
-        `git branch -D ${quoteShellArg(worktreeName)}`,
-        normalizedProjectPath
-      );
-    }
 
-    // Use --no-checkout to avoid checking out all files (repos can have 500K+ files).
-    // Then enable sparse-checkout so the agent only materializes files it touches.
-    const result = await this.sshService.executeCommand(
-      connectionId,
-      `git worktree add --no-checkout ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(
-        base
-      )}`,
-      normalizedProjectPath
+    // Single batched script: mkdir, cleanup stale branch, create worktree, sparse-checkout
+    const script = [
+      // Ensure worktrees directory exists
+      'mkdir -p .emdash/worktrees',
+      // Clean up stale branch from prior failed attempt (if any)
+      `if git rev-parse --verify refs/heads/${quoteShellArg(worktreeName)} >/dev/null 2>&1; then`,
+      `  rm -rf ${quoteShellArg(relWorktreePath)}`,
+      '  git worktree prune',
+      `  git branch -D ${quoteShellArg(worktreeName)} 2>/dev/null`,
+      'fi',
+      // Create worktree with --no-checkout (repos can have 500K+ files)
+      `git worktree add --no-checkout ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(base)}`,
+      // Enable sparse-checkout in cone mode
+      `cd ${quoteShellArg(worktreePath)} && git sparse-checkout init --cone`,
+      // Enable git optimizations for faster status queries
+      `cd ${quoteShellArg(worktreePath)} && git config core.fsmonitor true && git config core.untrackedCache true`,
+    ].join('\n');
+
+    log.info(
+      `[RemoteGitService] _createWorktreeImpl: running batched create script (elapsed ${Date.now() - implStart}ms)`
     );
+    const result = await this.exec(connectionId, script, normalizedProjectPath);
 
     if (result.exitCode !== 0) {
-      throw new Error(`Failed to create worktree: ${result.stderr}`);
+      log.error(
+        `[RemoteGitService] _createWorktreeImpl: FAILED after ${Date.now() - implStart}ms: ${result.stdout}`
+      );
+      throw new Error(`Failed to create worktree: ${result.stdout}`);
     }
 
-    // Enable sparse-checkout in cone mode — starts with only top-level files.
-    // The agent (or user) can add directories as needed with `git sparse-checkout add <dir>`.
-    await this.sshService.executeCommand(
-      connectionId,
-      'git sparse-checkout init --cone',
-      worktreePath
+    log.info(
+      `[RemoteGitService] _createWorktreeImpl: SUCCESS in ${Date.now() - implStart}ms, path=${worktreePath}`
     );
-
     return {
       path: worktreePath,
       branch: worktreeName,
@@ -232,24 +333,31 @@ export class RemoteGitService {
   async removeWorktree(
     connectionId: string,
     projectPath: string,
-    worktreePath: string
+    worktreePath: string,
+    branch?: string
   ): Promise<void> {
     const normalizedProjectPath = this.normalizeRemotePath(projectPath);
     const normalizedWorktreePath = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
-      connectionId,
+
+    // Single batched script: remove worktree + prune + delete branch
+    const parts = [
       `git worktree remove ${quoteShellArg(normalizedWorktreePath)} --force`,
-      normalizedProjectPath
-    );
+      'git worktree prune',
+    ];
+    if (branch) {
+      parts.push(`git branch -D ${quoteShellArg(branch)} 2>/dev/null || true`);
+    }
+
+    const result = await this.exec(connectionId, parts.join(' && '), normalizedProjectPath);
 
     if (result.exitCode !== 0) {
-      throw new Error(`Failed to remove worktree: ${result.stderr}`);
+      throw new Error(`Failed to remove worktree: ${result.stdout}`);
     }
   }
 
   async listWorktrees(connectionId: string, projectPath: string): Promise<WorktreeInfo[]> {
     const normalizedProjectPath = this.normalizeRemotePath(projectPath);
-    const result = await this.sshService.executeCommand(
+    const result = await this.exec(
       connectionId,
       'git worktree list --porcelain',
       normalizedProjectPath
@@ -293,9 +401,9 @@ export class RemoteGitService {
     untrackedFiles: string[];
   }> {
     const normalizedWorktreePath = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
+    const result = await this.exec(
       connectionId,
-      'git status --porcelain --untracked-files=all',
+      'GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=normal --no-renames',
       normalizedWorktreePath
     );
 
@@ -334,7 +442,7 @@ export class RemoteGitService {
   }
 
   async getBranchList(connectionId: string, projectPath: string): Promise<string[]> {
-    const result = await this.sshService.executeCommand(
+    const result = await this.exec(
       connectionId,
       'git branch -a --format="%(refname:short)"',
       this.normalizeRemotePath(projectPath)
@@ -362,11 +470,7 @@ export class RemoteGitService {
 
     command += ` -m ${quoteShellArg(message)}`;
 
-    return this.sshService.executeCommand(
-      connectionId,
-      command,
-      this.normalizeRemotePath(worktreePath)
-    );
+    return this.exec(connectionId, command, this.normalizeRemotePath(worktreePath));
   }
 
   // ---------------------------------------------------------------------------
@@ -380,7 +484,11 @@ export class RemoteGitService {
   async getStatusDetailed(connectionId: string, worktreePath: string): Promise<GitChange[]> {
     const key = `${connectionId}:${worktreePath}`;
     const inflight = this._statusDetailedInFlight.get(key);
-    if (inflight) return inflight;
+    if (inflight) {
+      log.info(`[RemoteGitService] getStatusDetailed: coalesced (in-flight already for ${key})`);
+      return inflight;
+    }
+    log.info(`[RemoteGitService] getStatusDetailed: starting for ${key}`);
 
     const promise = withTimeout(
       this._getStatusDetailedImpl(connectionId, worktreePath),
@@ -400,39 +508,37 @@ export class RemoteGitService {
   ): Promise<GitChange[]> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
-    // Verify git repo
-    const verifyResult = await this.sshService.executeCommand(
-      connectionId,
-      'git rev-parse --is-inside-work-tree',
-      cwd
-    );
-    if (verifyResult.exitCode !== 0) {
+    // Single script: verify repo + porcelain status + both numstats
+    // Sections separated by a unique delimiter so we can split the output
+    const SEP = '<<__EMDASH_SEP__>>';
+    const script = [
+      'export GIT_OPTIONAL_LOCKS=0',
+      'git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "__NOT_GIT__"; exit 0; }',
+      'git status --porcelain --untracked-files=normal --no-renames',
+      `echo '${SEP}'`,
+      'git diff --numstat --cached --no-renames',
+      `echo '${SEP}'`,
+      'git diff --numstat --no-renames',
+    ].join('; ');
+
+    const batchResult = await this.exec(connectionId, script, cwd);
+    const batchOutput = batchResult.stdout || '';
+
+    if (batchOutput.startsWith('__NOT_GIT__')) {
       return [];
     }
 
-    // Get porcelain status
-    const statusResult = await this.sshService.executeCommand(
-      connectionId,
-      'git status --porcelain --untracked-files=all',
-      cwd
-    );
-    if (statusResult.exitCode !== 0) {
-      throw new Error(`Git status failed: ${statusResult.stderr}`);
-    }
-
-    const statusOutput = statusResult.stdout;
-    if (!statusOutput.trim()) return [];
+    const sections = batchOutput.split(SEP);
+    const statusOutput = (sections[0] || '').replace(/^\n+/, '').replace(/\n+$/, '');
+    if (!statusOutput) return [];
 
     const statusLines = statusOutput
       .split('\n')
       .map((l) => l.replace(/\r$/, ''))
       .filter((l) => l.length > 0);
 
-    // Batch-fetch numstat for staged and unstaged changes (one SSH call each, not per-file)
-    const [stagedNumstat, unstagedNumstat] = await Promise.all([
-      this.sshService.executeCommand(connectionId, 'git diff --numstat --cached', cwd),
-      this.sshService.executeCommand(connectionId, 'git diff --numstat', cwd),
-    ]);
+    const stagedNumstatOutput = sections[1] || '';
+    const unstagedNumstatOutput = sections[2] || '';
 
     const parseNumstat = (stdout: string): Map<string, { add: number; del: number }> => {
       const map = new Map<string, { add: number; del: number }>();
@@ -447,8 +553,8 @@ export class RemoteGitService {
       return map;
     };
 
-    const stagedStats = parseNumstat(stagedNumstat.stdout || '');
-    const unstagedStats = parseNumstat(unstagedNumstat.stdout || '');
+    const stagedStats = parseNumstat(stagedNumstatOutput);
+    const unstagedStats = parseNumstat(unstagedNumstatOutput);
 
     // Collect untracked file paths so we can batch their line counts
     const untrackedPaths: string[] = [];
@@ -492,7 +598,7 @@ export class RemoteGitService {
         `if [ "$s" -le ${MAX_DIFF_CONTENT_BYTES} ] 2>/dev/null; then ` +
         `wc -l < "$f" 2>/dev/null || echo -1; ` +
         `else echo -1; fi; done`;
-      const countResult = await this.sshService.executeCommand(connectionId, script, cwd);
+      const countResult = await this.exec(connectionId, script, cwd);
       if (countResult.exitCode === 0) {
         const counts = countResult.stdout
           .split('\n')
@@ -535,7 +641,7 @@ export class RemoteGitService {
     const cwd = this.normalizeRemotePath(worktreePath);
 
     // Step 1: Run git diff
-    const diffResult = await this.sshService.executeCommand(
+    const diffResult = await this.exec(
       connectionId,
       `git diff --no-color --unified=2000 HEAD -- ${quoteShellArg(filePath)}`,
       cwd
@@ -553,14 +659,14 @@ export class RemoteGitService {
 
     // Step 3: Fetch content ONCE (non-binary only, covers both diff-success and fallback paths)
     const [showResult, catResult] = await Promise.all([
-      this.sshService.executeCommand(
+      this.exec(
         connectionId,
         `s=$(git cat-file -s HEAD:${quoteShellArg(filePath)} 2>/dev/null); ` +
           `if [ "$s" -le ${MAX_DIFF_CONTENT_BYTES} ] 2>/dev/null; then git show HEAD:${quoteShellArg(filePath)}; ` +
           `else echo "__EMDASH_TOO_LARGE__"; fi`,
         cwd
       ),
-      this.sshService.executeCommand(
+      this.exec(
         connectionId,
         `s=$(stat -c%s ${quoteShellArg(filePath)} 2>/dev/null || stat -f%z ${quoteShellArg(filePath)} 2>/dev/null); ` +
           `if [ "$s" -le ${MAX_DIFF_CONTENT_BYTES} ] 2>/dev/null; then cat ${quoteShellArg(filePath)}; else echo "__EMDASH_TOO_LARGE__"; fi`,
@@ -597,11 +703,7 @@ export class RemoteGitService {
 
   async stageFile(connectionId: string, worktreePath: string, filePath: string): Promise<void> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
-      connectionId,
-      `git add -- ${quoteShellArg(filePath)}`,
-      cwd
-    );
+    const result = await this.exec(connectionId, `git add -- ${quoteShellArg(filePath)}`, cwd);
     if (result.exitCode !== 0) {
       throw new Error(`Failed to stage file: ${result.stderr}`);
     }
@@ -609,7 +711,7 @@ export class RemoteGitService {
 
   async stageAllFiles(connectionId: string, worktreePath: string): Promise<void> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(connectionId, 'git add -A', cwd);
+    const result = await this.exec(connectionId, 'git add -A', cwd);
     if (result.exitCode !== 0) {
       throw new Error(`Failed to stage all files: ${result.stderr}`);
     }
@@ -617,7 +719,7 @@ export class RemoteGitService {
 
   async unstageFile(connectionId: string, worktreePath: string, filePath: string): Promise<void> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
+    const result = await this.exec(
       connectionId,
       `git reset HEAD -- ${quoteShellArg(filePath)}`,
       cwd
@@ -635,7 +737,7 @@ export class RemoteGitService {
     const cwd = this.normalizeRemotePath(worktreePath);
 
     // Check if file exists in HEAD
-    const catFileResult = await this.sshService.executeCommand(
+    const catFileResult = await this.exec(
       connectionId,
       `git cat-file -e HEAD:${quoteShellArg(filePath)}`,
       cwd
@@ -643,16 +745,12 @@ export class RemoteGitService {
 
     if (catFileResult.exitCode !== 0) {
       // File doesn't exist in HEAD — it's untracked. Delete it.
-      await this.sshService.executeCommand(
-        connectionId,
-        `rm -f -- ${quoteShellArg(filePath)}`,
-        cwd
-      );
+      await this.exec(connectionId, `rm -f -- ${quoteShellArg(filePath)}`, cwd);
       return { action: 'reverted' };
     }
 
     // File exists in HEAD — revert it
-    const checkoutResult = await this.sshService.executeCommand(
+    const checkoutResult = await this.exec(
       connectionId,
       `git checkout HEAD -- ${quoteShellArg(filePath)}`,
       cwd
@@ -669,11 +767,7 @@ export class RemoteGitService {
 
   async getCurrentBranch(connectionId: string, worktreePath: string): Promise<string> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
-      connectionId,
-      'git branch --show-current',
-      cwd
-    );
+    const result = await this.exec(connectionId, 'git branch --show-current', cwd);
     return (result.stdout || '').trim();
   }
 
@@ -695,47 +789,22 @@ export class RemoteGitService {
   ): Promise<string> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
-    // Try gh CLI first
-    const ghResult = await this.sshService.executeCommand(
-      connectionId,
-      'gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null',
-      cwd
-    );
-    if (ghResult.exitCode === 0 && ghResult.stdout.trim()) {
-      return ghResult.stdout.trim();
-    }
+    // Single script: try symbolic-ref (cached, fast), then remote show, fallback main
+    const script = [
+      'db=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)',
+      'if [ -n "$db" ]; then echo "${db##*/}"; exit 0; fi',
+      'db=$(git remote show origin 2>/dev/null | sed -n "/HEAD branch/s/.*: //p")',
+      'if [ -n "$db" ]; then echo "$db"; exit 0; fi',
+      'echo main',
+    ].join('; ');
 
-    // Fallback: parse git remote show origin
-    const remoteResult = await this.sshService.executeCommand(
-      connectionId,
-      'git remote show origin 2>/dev/null | sed -n "/HEAD branch/s/.*: //p"',
-      cwd
-    );
-    if (remoteResult.exitCode === 0 && remoteResult.stdout.trim()) {
-      return remoteResult.stdout.trim();
-    }
-
-    // Fallback: symbolic-ref
-    const symrefResult = await this.sshService.executeCommand(
-      connectionId,
-      'git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null',
-      cwd
-    );
-    if (symrefResult.exitCode === 0 && symrefResult.stdout.trim()) {
-      const parts = symrefResult.stdout.trim().split('/');
-      return parts[parts.length - 1];
-    }
-
-    return 'main';
+    const result = await this.exec(connectionId, script, cwd);
+    return (result.stdout || 'main').trim();
   }
 
   async createBranch(connectionId: string, worktreePath: string, name: string): Promise<void> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    const result = await this.sshService.executeCommand(
-      connectionId,
-      `git checkout -b ${quoteShellArg(name)}`,
-      cwd
-    );
+    const result = await this.exec(connectionId, `git checkout -b ${quoteShellArg(name)}`, cwd);
     if (result.exitCode !== 0) {
       throw new Error(`Failed to create branch: ${result.stderr}`);
     }
@@ -752,7 +821,7 @@ export class RemoteGitService {
     if (setUpstream && branch) {
       cmd = `git push --set-upstream origin ${quoteShellArg(branch)}`;
     }
-    return this.sshService.executeCommand(connectionId, cmd, cwd);
+    return this.exec(connectionId, cmd, cwd);
   }
 
   async getBranchStatus(
@@ -772,36 +841,33 @@ export class RemoteGitService {
   ): Promise<{ branch: string; defaultBranch: string; ahead: number; behind: number }> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
-    const branch = await this.getCurrentBranch(connectionId, worktreePath);
-    const defaultBranch = await this.getDefaultBranchName(connectionId, worktreePath);
+    // Single script: get current branch, detect default branch, compute ahead/behind
+    // Output format: branch\ndefaultBranch\nahead behind
+    const script = [
+      'export GIT_OPTIONAL_LOCKS=0',
+      // Line 1: current branch
+      'git branch --show-current',
+      // Line 2: default branch (try symbolic-ref first (cached, fast), then remote show, fallback main)
+      'db=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed "s|.*/||")',
+      'if [ -z "$db" ]; then db=$(git remote show origin 2>/dev/null | sed -n "/HEAD branch/s/.*: //p"); fi',
+      'if [ -z "$db" ]; then db=main; fi',
+      'echo "$db"',
+      // Line 3: ahead/behind counts
+      'git rev-list --left-right --count "origin/$db...HEAD" 2>/dev/null || echo "0 0"',
+    ].join('; ');
+
+    const result = await this.exec(connectionId, script, cwd);
+    const lines = (result.stdout || '').split('\n').map((l) => l.trim());
+
+    const branch = lines[0] || '';
+    const defaultBranch = lines[1] || 'main';
 
     let ahead = 0;
     let behind = 0;
-    const revListResult = await this.sshService.executeCommand(
-      connectionId,
-      `git rev-list --left-right --count origin/${quoteShellArg(defaultBranch)}...HEAD 2>/dev/null`,
-      cwd
-    );
-    if (revListResult.exitCode === 0) {
-      const parts = (revListResult.stdout || '').trim().split(/\s+/);
-      if (parts.length >= 2) {
-        behind = parseInt(parts[0] || '0', 10) || 0;
-        ahead = parseInt(parts[1] || '0', 10) || 0;
-      }
-    } else {
-      // Fallback: parse git status -sb
-      const statusResult = await this.sshService.executeCommand(
-        connectionId,
-        'git status -sb',
-        cwd
-      );
-      if (statusResult.exitCode === 0) {
-        const line = (statusResult.stdout || '').split('\n')[0] || '';
-        const aheadMatch = line.match(/ahead\s+(\d+)/i);
-        const behindMatch = line.match(/behind\s+(\d+)/i);
-        if (aheadMatch) ahead = parseInt(aheadMatch[1], 10) || 0;
-        if (behindMatch) behind = parseInt(behindMatch[1], 10) || 0;
-      }
+    const counts = (lines[2] || '').split(/\s+/);
+    if (counts.length >= 2) {
+      behind = parseInt(counts[0] || '0', 10) || 0;
+      ahead = parseInt(counts[1] || '0', 10) || 0;
     }
 
     return { branch, defaultBranch, ahead, behind };
@@ -828,7 +894,7 @@ export class RemoteGitService {
 
     // Check if remote exists
     let hasRemote = false;
-    const remoteCheck = await this.sshService.executeCommand(
+    const remoteCheck = await this.exec(
       connectionId,
       `git remote get-url ${quoteShellArg(remote)} 2>/dev/null`,
       cwd
@@ -836,17 +902,13 @@ export class RemoteGitService {
     if (remoteCheck.exitCode === 0) {
       hasRemote = true;
       // Try to fetch (non-fatal)
-      await this.sshService.executeCommand(
-        connectionId,
-        `git fetch --prune ${quoteShellArg(remote)} 2>/dev/null`,
-        cwd
-      );
+      await this.exec(connectionId, `git fetch --prune ${quoteShellArg(remote)} 2>/dev/null`, cwd);
     }
 
     let branches: Array<{ ref: string; remote: string; branch: string; label: string }> = [];
 
     if (hasRemote) {
-      const { stdout } = await this.sshService.executeCommand(
+      const { stdout } = await this.exec(
         connectionId,
         `git for-each-ref --format="%(refname:short)" refs/remotes/${quoteShellArg(remote)}`,
         cwd
@@ -867,7 +929,7 @@ export class RemoteGitService {
         });
 
       // Include local-only branches
-      const localResult = await this.sshService.executeCommand(
+      const localResult = await this.exec(
         connectionId,
         'git for-each-ref --format="%(refname:short)" refs/heads/',
         cwd
@@ -880,7 +942,7 @@ export class RemoteGitService {
         .map((branch) => ({ ref: branch, remote: '', branch, label: branch }));
       branches = [...branches, ...localOnly];
     } else {
-      const localResult = await this.sshService.executeCommand(
+      const localResult = await this.exec(
         connectionId,
         'git for-each-ref --format="%(refname:short)" refs/heads/',
         cwd
@@ -906,7 +968,7 @@ export class RemoteGitService {
     // Check remote tracking before rename
     let remotePushed = false;
     let remoteName = 'origin';
-    const configResult = await this.sshService.executeCommand(
+    const configResult = await this.exec(
       connectionId,
       `git config --get branch.${quoteShellArg(oldBranch)}.remote 2>/dev/null`,
       cwd
@@ -915,7 +977,7 @@ export class RemoteGitService {
       remoteName = configResult.stdout.trim();
       remotePushed = true;
     } else {
-      const lsResult = await this.sshService.executeCommand(
+      const lsResult = await this.exec(
         connectionId,
         `git ls-remote --heads origin ${quoteShellArg(oldBranch)} 2>/dev/null`,
         cwd
@@ -926,7 +988,7 @@ export class RemoteGitService {
     }
 
     // Rename local branch
-    const renameResult = await this.sshService.executeCommand(
+    const renameResult = await this.exec(
       connectionId,
       `git branch -m ${quoteShellArg(oldBranch)} ${quoteShellArg(newBranch)}`,
       cwd
@@ -938,13 +1000,13 @@ export class RemoteGitService {
     // Update remote if needed
     if (remotePushed) {
       // Delete old remote branch (non-fatal)
-      await this.sshService.executeCommand(
+      await this.exec(
         connectionId,
         `git push ${quoteShellArg(remoteName)} --delete ${quoteShellArg(oldBranch)} 2>/dev/null`,
         cwd
       );
       // Push new branch
-      const pushResult = await this.sshService.executeCommand(
+      const pushResult = await this.exec(
         connectionId,
         `git push -u ${quoteShellArg(remoteName)} ${quoteShellArg(newBranch)}`,
         cwd
@@ -961,13 +1023,44 @@ export class RemoteGitService {
   // GitHub CLI operations (run gh commands over SSH)
   // ---------------------------------------------------------------------------
 
+  /** Tracks whether `gh` CLI is available per connection. */
+  private _ghAvailable = new Map<string, boolean>();
+  /** Coalesces the initial `gh` probe so concurrent calls don't all hit SSH. */
+  private _ghProbe = new Map<string, Promise<boolean>>();
+
   async execGh(connectionId: string, worktreePath: string, ghArgs: string): Promise<ExecResult> {
+    // Fast path: if we already know gh isn't installed, don't waste an SSH channel
+    if (this._ghAvailable.get(connectionId) === false) {
+      return { stdout: '', stderr: 'gh: command not found (cached)', exitCode: 127 };
+    }
+
+    // First call: probe gh availability (coalesced across concurrent callers)
+    if (!this._ghAvailable.has(connectionId)) {
+      let probe = this._ghProbe.get(connectionId);
+      if (!probe) {
+        probe = this.exec(
+          connectionId,
+          'command -v gh >/dev/null 2>&1 && echo yes || echo no',
+          this.normalizeRemotePath(worktreePath)
+        )
+          .then((r) => r.stdout.trim() === 'yes')
+          .catch(() => false)
+          .finally(() => this._ghProbe.delete(connectionId));
+        this._ghProbe.set(connectionId, probe);
+      }
+      const available = await probe;
+      this._ghAvailable.set(connectionId, available);
+      if (!available) {
+        return { stdout: '', stderr: 'gh: command not found', exitCode: 127 };
+      }
+    }
+
     const cwd = this.normalizeRemotePath(worktreePath);
-    return this.sshService.executeCommand(connectionId, `gh ${ghArgs}`, cwd);
+    return this.exec(connectionId, `gh ${ghArgs}`, cwd);
   }
 
   async execGit(connectionId: string, worktreePath: string, gitArgs: string): Promise<ExecResult> {
     const cwd = this.normalizeRemotePath(worktreePath);
-    return this.sshService.executeCommand(connectionId, `git ${gitArgs}`, cwd);
+    return this.exec(connectionId, `git ${gitArgs}`, cwd);
   }
 }

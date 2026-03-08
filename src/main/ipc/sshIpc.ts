@@ -1,6 +1,7 @@
 import { ipcMain } from 'electron';
 import { SSH_IPC_CHANNELS } from '../../shared/ssh/types';
 import { sshService } from '../services/ssh/SshService';
+import { RemoteAgentService } from '../services/ssh/RemoteAgentService';
 import { SshCredentialService } from '../services/ssh/SshCredentialService';
 import { SshHostKeyService } from '../services/ssh/SshHostKeyService';
 import { SshConnectionMonitor } from '../services/ssh/SshConnectionMonitor';
@@ -23,6 +24,9 @@ const credentialService = new SshCredentialService();
 // Host key service initialized for future use (host key verification)
 const _hostKeyService = new SshHostKeyService();
 const monitor = new SshConnectionMonitor((id) => sshService.isConnected(id));
+
+/** Persistent shell channel manager — shared with worktreeIpc and gitIpc. */
+export const remoteAgentService = new RemoteAgentService(sshService);
 
 // When ssh2 detects a dead connection (via keepalive) and emits `close`,
 // SshService removes it from the pool and emits `disconnected`.
@@ -358,6 +362,7 @@ export function registerSshIpc() {
         // Stop monitoring BEFORE disconnecting so the monitor's
         // handleDisconnect listener doesn't trigger a reconnect.
         monitor.stopMonitoring(id);
+        remoteAgentService.close(id);
         if (sshService.isConnected(id)) {
           try {
             await sshService.disconnect(id);
@@ -494,6 +499,7 @@ export function registerSshIpc() {
         // handleDisconnect listener doesn't trigger a reconnect
         // for an intentional disconnect.
         monitor.stopMonitoring(connectionId);
+        remoteAgentService.close(connectionId);
         await sshService.disconnect(connectionId);
         void import('../telemetry').then(({ capture }) => {
           void capture('ssh_disconnected');
