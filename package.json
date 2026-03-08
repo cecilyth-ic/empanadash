@@ -147,8 +147,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "generalaction",
-        "repo": "emdash",
+        "owner": "cecilyth-ic",
+        "repo": "empanadash",
         "releaseType": "release"
       }
     ],
