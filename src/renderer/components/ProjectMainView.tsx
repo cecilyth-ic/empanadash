@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import mascot from '../../assets/images/empanadash/mascot.png';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import {
@@ -1036,7 +1037,7 @@ const ProjectMainView: React.FC<ProjectMainViewProps> = ({
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center py-12 text-center">
-                      <Archive className="mb-3 h-12 w-12 text-muted-foreground/50" />
+                      <img src={mascot} alt="" className="mb-3 h-16 w-16" />
                       <p className="text-sm text-muted-foreground">
                         {searchFilter.trim()
                           ? 'No tasks match your search.'

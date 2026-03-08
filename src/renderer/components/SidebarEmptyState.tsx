@@ -2,6 +2,7 @@ import React from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
 import { FolderOpen } from 'lucide-react';
+import mascot from '../../assets/images/empanadash/mascot.png';
 
 type Props = {
   title: string;
@@ -24,6 +25,7 @@ const SidebarEmptyState: React.FC<Props> = ({
     <div className="min-w-0 overflow-hidden">
       <Card className="bg-muted/20">
         <CardHeader className="p-4">
+          <img src={mascot} alt="" className="mb-2 h-16 w-16" />
           <CardTitle className="text-lg font-semibold leading-tight">{title}</CardTitle>
           {description ? (
             <CardDescription className="text-sm leading-relaxed">{description}</CardDescription>

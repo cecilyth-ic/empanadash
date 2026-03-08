@@ -1,9 +1,6 @@
 import { motion } from 'framer-motion';
 import { FolderOpen, Github, Plus, Server } from 'lucide-react';
 import React from 'react';
-import emdashLogo from '../../assets/images/emdash/emdash_logo.svg';
-import emdashLogoWhite from '../../assets/images/emdash/emdash_logo_white.svg';
-import { useTheme } from '../hooks/useTheme';
 
 interface HomeViewProps {
   onOpenProject: () => void;
@@ -18,39 +15,26 @@ const HomeView: React.FC<HomeViewProps> = ({
   onCloneProjectClick,
   onAddRemoteProject,
 }) => {
-  const { effectiveTheme } = useTheme();
-
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background text-foreground">
       <div className="container mx-auto flex min-h-full max-w-3xl flex-1 flex-col justify-center px-8 py-8">
         <div className="mb-3 text-center">
-          <div className="mb-3 flex items-center justify-center">
-            <div className="logo-shimmer-container">
-              <img
-                key={effectiveTheme}
-                src={
-                  effectiveTheme === 'dark' || effectiveTheme === 'dark-black'
-                    ? emdashLogoWhite
-                    : emdashLogo
-                }
-                alt="Emdash"
-                className="logo-shimmer-image"
+          <div className="mb-2 flex items-center justify-center gap-3">
+            <svg
+              width="46"
+              height="28"
+              viewBox="0 0 104 28"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              aria-hidden="true"
+            >
+              <path
+                d="M23.235 0H103.519L80.2841 27.88H0L23.235 0Z"
+                fill="currentColor"
+                className="opacity-70"
               />
-              <span
-                className="logo-shimmer-overlay"
-                aria-hidden="true"
-                style={{
-                  WebkitMaskImage: `url(${effectiveTheme === 'dark' || effectiveTheme === 'dark-black' ? emdashLogoWhite : emdashLogo})`,
-                  maskImage: `url(${effectiveTheme === 'dark' || effectiveTheme === 'dark-black' ? emdashLogoWhite : emdashLogo})`,
-                  WebkitMaskRepeat: 'no-repeat',
-                  maskRepeat: 'no-repeat',
-                  WebkitMaskSize: 'contain',
-                  maskSize: 'contain',
-                  WebkitMaskPosition: 'center',
-                  maskPosition: 'center',
-                }}
-              />
-            </div>
+            </svg>
+            <span className="text-4xl font-semibold tracking-tight">empanadash</span>
           </div>
           <p className="whitespace-nowrap text-xs text-muted-foreground">
             Agentic Development Environment
