@@ -690,6 +690,24 @@ export function registerSshIpc() {
     }
   );
 
+  // Get all connection states in a single batch call
+  ipcMain.handle(
+    SSH_IPC_CHANNELS.GET_ALL_STATES,
+    async (): Promise<{
+      success: boolean;
+      states?: Array<{ connectionId: string; state: ConnectionState }>;
+      error?: string;
+    }> => {
+      try {
+        const states = monitor.getAllStates();
+        return { success: true, states };
+      } catch (err: any) {
+        console.error('[sshIpc] Get all states error:', err);
+        return { success: false, error: err.message };
+      }
+    }
+  );
+
   // Get SSH config hosts from ~/.ssh/config
   ipcMain.handle(
     SSH_IPC_CHANNELS.GET_SSH_CONFIG,

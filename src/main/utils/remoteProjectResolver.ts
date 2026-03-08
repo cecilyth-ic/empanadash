@@ -20,7 +20,10 @@ export async function resolveRemoteProjectForWorktreePath(
   // Pick the longest matching remotePath prefix.
   const candidates = all
     .filter((p) => isRemoteProject(p))
-    .filter((p) => worktreePath.startsWith(p.remotePath.replace(/\/+$/g, '') + '/'))
+    .filter((p) => {
+      const normalized = p.remotePath.replace(/\/+$/g, '');
+      return worktreePath === normalized || worktreePath.startsWith(normalized + '/');
+    })
     .sort((a, b) => b.remotePath.length - a.remotePath.length);
   return candidates[0] ?? null;
 }

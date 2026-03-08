@@ -10,6 +10,7 @@ import TaskCreationLoading from './TaskCreationLoading';
 import { useProjectManagementContext } from '../contexts/ProjectManagementProvider';
 import { useTaskManagementContext } from '../contexts/TaskManagementContext';
 import { useProjectRemoteInfo } from '../hooks/useProjectRemoteInfo';
+import { useRemoteProject } from '../hooks/useRemoteProject';
 
 interface MainContentAreaProps {
   showSettingsPage: boolean;
@@ -40,6 +41,11 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
     handleCloneProjectClick,
     handleAddRemoteProject,
   } = useProjectManagementContext();
+
+  // Establish the ssh2 connection for the selected remote project.
+  // This is the ONLY place useRemoteProject should run — once per selected project.
+  // Sidebar items use the lightweight useConnectionStateFromCache instead.
+  useRemoteProject(selectedProject ?? null);
   const {
     activeTask,
     activeTaskAgent,
@@ -96,7 +102,9 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
   if (selectedProject) {
     return (
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-        {activeTask ? (
+        {isCreatingTask ? (
+          <TaskCreationLoading />
+        ) : activeTask ? (
           (activeTask.metadata as any)?.multiAgent?.enabled ? (
             <MultiAgentTask
               task={activeTask}
@@ -137,12 +145,6 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
             isLoadingBranches={isLoadingBranches}
             onBaseBranchChange={setProjectDefaultBranch}
           />
-        )}
-
-        {isCreatingTask && (
-          <div className="absolute inset-0 z-10 bg-background">
-            <TaskCreationLoading />
-          </div>
         )}
       </div>
     );

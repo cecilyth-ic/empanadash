@@ -936,22 +936,41 @@ export function useTaskManagement() {
     setIsCreatingTask(false);
   }, []);
 
-  // isCreatingTask safety-net: clear after 30s if task interface never signals ready
+  // Clear isCreatingTask as soon as activeTask arrives — the task was created successfully.
+  // Without this, the exclusive rendering in MainContentArea creates a deadlock:
+  // isCreatingTask=true → TaskCreationLoading renders → ChatInterface never mounts →
+  // onTaskInterfaceReady never fires → isCreatingTask never clears.
+  useEffect(() => {
+    if (isCreatingTask && activeTask) {
+      setIsCreatingTask(false);
+    }
+  }, [isCreatingTask, activeTask]);
+
+  // isCreatingTask safety-net: clear after 30s if task interface never signals ready.
   useEffect(() => {
     if (!isCreatingTask) return;
     const timeout = window.setTimeout(() => {
       setIsCreatingTask(false);
+      toast({
+        title: 'Task creation timed out',
+        description:
+          'The operation is taking longer than expected. Check your connection and try again.',
+        variant: 'destructive',
+      });
     }, 30000);
     return () => {
       window.clearTimeout(timeout);
     };
-  }, [isCreatingTask]);
+  }, [isCreatingTask, toast]);
 
   // Wire up openTaskModal — TaskModalOverlay calls handleCreateTask via context
   openTaskModalImplRef.current = () => {
     showModal('taskModal', {
       onClose: () => {
         pendingTaskProjectRef.current = null;
+        // When the modal closes (user dismiss OR success), clear the creating
+        // overlay so the UI isn't blocked while a timed-out IPC call is in flight.
+        setIsCreatingTask(false);
       },
     });
   };

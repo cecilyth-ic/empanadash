@@ -28,7 +28,7 @@ import SidebarEmptyState from '../SidebarEmptyState';
 import { TaskItem } from '../TaskItem';
 import { TaskDeleteButton } from '../TaskDeleteButton';
 import { RemoteProjectIndicator } from '../ssh/RemoteProjectIndicator';
-import { useRemoteProject } from '../../hooks/useRemoteProject';
+import { useConnectionStateFromCache } from '../../hooks/useRemoteProject';
 import type { Project } from '../../types/app';
 import type { ConnectionState } from '../ssh';
 import { useProjectManagementContext } from '../../contexts/ProjectManagementProvider';
@@ -61,8 +61,13 @@ interface ProjectItemProps {
 }
 
 const ProjectItem = React.memo<ProjectItemProps>(({ project }) => {
-  const remote = useRemoteProject(project);
   const connectionId = getConnectionId(project);
+  // Subscribe to the centralized batch poller — one IPC call for ALL connections,
+  // not a separate polling loop per sidebar item.
+  const cachedState = useConnectionStateFromCache(
+    isRemoteProject(project) ? project.id : null,
+    connectionId
+  );
 
   if (!connectionId && !isRemoteProject(project)) {
     return <span className="flex-1 truncate">{project.name}</span>;
@@ -72,11 +77,10 @@ const ProjectItem = React.memo<ProjectItemProps>(({ project }) => {
     <div className="flex min-w-0 items-center gap-2">
       {connectionId && (
         <RemoteProjectIndicator
-          host={remote.host || undefined}
-          connectionState={remote.connectionState as ConnectionState}
+          host={undefined}
+          connectionState={cachedState as ConnectionState}
           size="md"
-          onReconnect={remote.reconnect}
-          disabled={remote.isLoading}
+          disabled
         />
       )}
       <span className="flex-1 truncate">{project.name}</span>

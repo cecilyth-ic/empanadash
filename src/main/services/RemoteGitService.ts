@@ -22,7 +22,28 @@ export interface GitStatus {
   files: GitStatusFile[];
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`SSH operation timed out after ${ms}ms: ${label}`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export class RemoteGitService {
+  /** Coalesces in-flight getStatusDetailed calls for the same connection+path. */
+  private _statusDetailedInFlight: Map<string, Promise<GitChange[]>> = new Map();
+
   constructor(private sshService: SshService) {}
 
   private normalizeRemotePath(p: string): string {
@@ -98,6 +119,19 @@ export class RemoteGitService {
     taskName: string,
     baseRef?: string
   ): Promise<WorktreeInfo> {
+    return withTimeout(
+      this._createWorktreeImpl(connectionId, projectPath, taskName, baseRef),
+      60_000,
+      'createWorktree'
+    );
+  }
+
+  private async _createWorktreeImpl(
+    connectionId: string,
+    projectPath: string,
+    taskName: string,
+    baseRef?: string
+  ): Promise<WorktreeInfo> {
     const normalizedProjectPath = this.normalizeRemotePath(projectPath);
     const slug = taskName
       .toLowerCase()
@@ -139,9 +173,38 @@ export class RemoteGitService {
       base = 'HEAD';
     }
 
+    // Clean up any stale branch/worktree from a previous failed attempt
+    const checkBranch = await this.sshService.executeCommand(
+      connectionId,
+      `git rev-parse --verify refs/heads/${quoteShellArg(worktreeName)} 2>/dev/null`,
+      normalizedProjectPath
+    );
+    if (checkBranch.exitCode === 0) {
+      // Branch exists from a prior failed attempt.
+      // Remove the worktree directory first — git branch -D refuses to delete
+      // a branch that's checked out in any worktree (even a stale one).
+      await this.sshService.executeCommand(
+        connectionId,
+        `rm -rf ${quoteShellArg(relWorktreePath)}`,
+        normalizedProjectPath
+      );
+      await this.sshService.executeCommand(
+        connectionId,
+        'git worktree prune',
+        normalizedProjectPath
+      );
+      await this.sshService.executeCommand(
+        connectionId,
+        `git branch -D ${quoteShellArg(worktreeName)}`,
+        normalizedProjectPath
+      );
+    }
+
+    // Use --no-checkout to avoid checking out all files (repos can have 500K+ files).
+    // Then enable sparse-checkout so the agent only materializes files it touches.
     const result = await this.sshService.executeCommand(
       connectionId,
-      `git worktree add ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(
+      `git worktree add --no-checkout ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(
         base
       )}`,
       normalizedProjectPath
@@ -150,6 +213,14 @@ export class RemoteGitService {
     if (result.exitCode !== 0) {
       throw new Error(`Failed to create worktree: ${result.stderr}`);
     }
+
+    // Enable sparse-checkout in cone mode — starts with only top-level files.
+    // The agent (or user) can add directories as needed with `git sparse-checkout add <dir>`.
+    await this.sshService.executeCommand(
+      connectionId,
+      'git sparse-checkout init --cone',
+      worktreePath
+    );
 
     return {
       path: worktreePath,
@@ -307,6 +378,26 @@ export class RemoteGitService {
    * Parses porcelain output, numstat diffs, and untracked file line counts.
    */
   async getStatusDetailed(connectionId: string, worktreePath: string): Promise<GitChange[]> {
+    const key = `${connectionId}:${worktreePath}`;
+    const inflight = this._statusDetailedInFlight.get(key);
+    if (inflight) return inflight;
+
+    const promise = withTimeout(
+      this._getStatusDetailedImpl(connectionId, worktreePath),
+      20_000,
+      'getStatusDetailed'
+    ).finally(() => {
+      this._statusDetailedInFlight.delete(key);
+    });
+
+    this._statusDetailedInFlight.set(key, promise);
+    return promise;
+  }
+
+  private async _getStatusDetailedImpl(
+    connectionId: string,
+    worktreePath: string
+  ): Promise<GitChange[]> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
     // Verify git repo
@@ -425,6 +516,18 @@ export class RemoteGitService {
    * Uses a diff-first pattern: run git diff, check for binary, then fetch content only if non-binary.
    */
   async getFileDiff(
+    connectionId: string,
+    worktreePath: string,
+    filePath: string
+  ): Promise<DiffResult> {
+    return withTimeout(
+      this._getFileDiffImpl(connectionId, worktreePath, filePath),
+      20_000,
+      'getFileDiff'
+    );
+  }
+
+  private async _getFileDiffImpl(
     connectionId: string,
     worktreePath: string,
     filePath: string
@@ -579,6 +682,17 @@ export class RemoteGitService {
    * Unlike getDefaultBranch(), this specifically queries origin's default (not current branch).
    */
   async getDefaultBranchName(connectionId: string, worktreePath: string): Promise<string> {
+    return withTimeout(
+      this._getDefaultBranchNameImpl(connectionId, worktreePath),
+      30_000,
+      'getDefaultBranchName'
+    );
+  }
+
+  private async _getDefaultBranchNameImpl(
+    connectionId: string,
+    worktreePath: string
+  ): Promise<string> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
     // Try gh CLI first
@@ -645,6 +759,17 @@ export class RemoteGitService {
     connectionId: string,
     worktreePath: string
   ): Promise<{ branch: string; defaultBranch: string; ahead: number; behind: number }> {
+    return withTimeout(
+      this._getBranchStatusImpl(connectionId, worktreePath),
+      30_000,
+      'getBranchStatus'
+    );
+  }
+
+  private async _getBranchStatusImpl(
+    connectionId: string,
+    worktreePath: string
+  ): Promise<{ branch: string; defaultBranch: string; ahead: number; behind: number }> {
     const cwd = this.normalizeRemotePath(worktreePath);
 
     const branch = await this.getCurrentBranch(connectionId, worktreePath);
@@ -683,6 +808,18 @@ export class RemoteGitService {
   }
 
   async listBranches(
+    connectionId: string,
+    projectPath: string,
+    remote = 'origin'
+  ): Promise<Array<{ ref: string; remote: string; branch: string; label: string }>> {
+    return withTimeout(
+      this._listBranchesImpl(connectionId, projectPath, remote),
+      30_000,
+      'listBranches'
+    );
+  }
+
+  private async _listBranchesImpl(
     connectionId: string,
     projectPath: string,
     remote = 'origin'
