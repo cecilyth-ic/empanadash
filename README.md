@@ -11,20 +11,3 @@ Pre-built releases for macOS, Linux, and Windows are available on the [releases 
 ### Agent Teams
 
 Agents can spawn teammate tabs using Claude's `Agent` tool. When an agent calls `Agent` with `run_in_background: true`, empanadash intercepts the event via a PostToolUse hook and opens a new conversation tab — automatically attaching to the spawned agent's tmux session. This lets a single task fan out into a live multi-agent team, all visible in the UI.
-
-More customizations are planned.
-
-## Development
-
-See [AGENTS.md](AGENTS.md) for the full architecture and development guide.
-
-```bash
-pnpm run d   # install deps + start dev
-```
-
-## Syncing with upstream
-
-```bash
-git fetch upstream
-git merge upstream/main
-```
