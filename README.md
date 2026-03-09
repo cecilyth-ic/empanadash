@@ -1,7 +1,6 @@
 # empanadash
 
-A customized fork of [emdash](https://github.com/generalaction/emdash) — a cross-platform Electron app that orchestrates multiple CLI coding agents (Claude Code, Codex, Amp, etc.) in parallel, each isolated in their own Git worktree. The name is a wrapper/dumpling pun. The app is also a wrapper.
-
+A customized fork of [emdash](https://github.com/generalaction/emdash) — a cross-platform Electron app that orchestrates multiple CLI coding agents (Claude Code, Codex, Amp, etc.) in parallel, each isolated in their own Git worktree. 
 ## Download
 
 Pre-built releases for macOS, Linux, and Windows are available on the [releases page](https://github.com/cecilyth-ic/empanadash/releases/latest).
