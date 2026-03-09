@@ -381,6 +381,15 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
+          if [ "${{ steps.signing.outputs.has_signing }}" != "true" ]; then
+            echo "Azure signing secrets not available; removing azureSignOptions for unsigned build."
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+              delete pkg.build.win.azureSignOptions;
+              fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+            "
+          fi
           pnpm exec electron-builder --win nsis msi --x64 --publish never --config.npmRebuild=false
           ls -lah release || true
 

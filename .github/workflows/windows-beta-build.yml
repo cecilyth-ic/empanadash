@@ -87,6 +87,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Remove Azure signing config since beta builds are unsigned
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            if (pkg.build?.win?.azureSignOptions) {
+              delete pkg.build.win.azureSignOptions;
+              fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+              console.log('Removed azureSignOptions for unsigned beta build.');
+            }
+          "
           pnpm exec electron-builder --win nsis msi --x64 --publish never --config.npmRebuild=false
           ls -lah release || true
 
