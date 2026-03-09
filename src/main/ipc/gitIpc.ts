@@ -48,12 +48,14 @@ type GitStatusWatchEntry = {
 const gitStatusWatchers = new Map<string, GitStatusWatchEntry>();
 
 // Remote polling for SSH projects (replaces fs.watch)
-const REMOTE_POLL_INTERVAL_MS = 5000;
+const REMOTE_POLL_INTERVAL_MS = 15_000;
 type RemoteStatusPollEntry = {
   intervalId: NodeJS.Timeout;
   watchIds: Set<string>;
   lastStatusHash: string;
   connectionId: string;
+  /** True while the previous poll is still awaiting a response. */
+  polling: boolean;
 };
 const remoteStatusPollers = new Map<string, RemoteStatusPollEntry>();
 
@@ -70,23 +72,45 @@ const ensureRemoteStatusPoller = (
 
   const entry: RemoteStatusPollEntry = {
     intervalId: setInterval(async () => {
+      const poller = remoteStatusPollers.get(taskPath);
+      if (!poller) return;
+      // Skip this tick if the previous poll is still in-flight — prevents
+      // queue flooding when commands take longer than the poll interval.
+      if (poller.polling) {
+        log.info(`[gitIpc] remote status poll skipped (previous still in-flight): ${taskPath}`);
+        return;
+      }
+      poller.polling = true;
       try {
         const changes = await remoteGitService.getStatusDetailed(connectionId, taskPath);
         // Simple hash: join paths + statuses to detect changes
         const hash = changes.map((c) => `${c.path}:${c.status}:${c.isStaged}`).join('|');
-        const poller = remoteStatusPollers.get(taskPath);
         if (!poller) return;
         if (hash !== poller.lastStatusHash) {
           poller.lastStatusHash = hash;
           broadcastGitStatusChange(taskPath);
         }
-      } catch {
+      } catch (err) {
+        // If the worktree was deleted or path is gone, stop polling
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('not found') || msg.includes('timed out') || msg.includes('128')) {
+          log.warn(
+            `[gitIpc] remote status poll: stopping poller for ${taskPath} after error: ${msg}`
+          );
+          clearInterval(poller.intervalId);
+          remoteStatusPollers.delete(taskPath);
+          return;
+        }
         // Connection may have dropped — don't crash, just skip this poll
+      } finally {
+        const p = remoteStatusPollers.get(taskPath);
+        if (p) p.polling = false;
       }
     }, REMOTE_POLL_INTERVAL_MS),
     watchIds: new Set([watchId]),
     lastStatusHash: '',
     connectionId,
+    polling: false,
   };
   remoteStatusPollers.set(taskPath, entry);
   return { success: true, watchId };
@@ -823,7 +847,23 @@ export function registerGitIpc() {
                 risk.error = prRes.error;
               }
             } catch (error) {
-              risk.error = error instanceof Error ? error.message : String(error);
+              const msg = error instanceof Error ? error.message : String(error);
+              // For remote projects, connection errors shouldn't block deletion.
+              // The user can't verify risks when disconnected — let them proceed.
+              const isConnectionError =
+                msg.includes('not found') ||
+                msg.includes('timed out') ||
+                msg.includes('Channel open failure');
+              const remoteProject = await resolveRemoteProjectForWorktreePath(
+                target.taskPath
+              ).catch(() => null);
+              if (remoteProject && isConnectionError) {
+                log.warn(
+                  `[gitIpc] delete-risks: skipping risk check for remote task ${target.id} (connection unavailable): ${msg}`
+                );
+              } else {
+                risk.error = msg;
+              }
             }
 
             return [target.id, risk] as const;

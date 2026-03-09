@@ -355,6 +355,14 @@ export class SshService extends EventEmitter {
   }
 
   /**
+   * Returns the raw ssh2 Client for a connection, or undefined if not connected.
+   * Used by PersistentShellChannel to open exec channels on the existing connection.
+   */
+  getClient(connectionId: string): Client | undefined {
+    return this.connections[connectionId]?.client;
+  }
+
+  /**
    * Gets connection info for a specific connection.
    * @param connectionId - ID of the connection
    * @returns Connection object or undefined if not found

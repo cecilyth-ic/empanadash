@@ -237,7 +237,7 @@ export function useTaskChanges(
   }, [taskPath, shouldPoll, fetchChanges, scheduleIdleRefresh, clearIdleHandle]);
 
   useEffect(() => {
-    if (!taskPath) return;
+    if (!taskPath || !shouldPoll) return;
     const api = window.electronAPI;
     let off: (() => void) | undefined;
     let watchId: string | undefined;
@@ -280,7 +280,7 @@ export function useTaskChanges(
         api.unwatchGitStatus(taskPath, watchId).catch(() => {});
       }
     };
-  }, [taskPath, fetchChanges]);
+  }, [taskPath, shouldPoll, fetchChanges]);
 
   return {
     ...changes,
