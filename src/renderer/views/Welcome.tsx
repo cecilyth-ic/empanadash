@@ -1,4 +1,4 @@
-import mascot from '../../assets/images/empanadash/mascot.png';
+import icon from '../../assets/images/empanadash/icon.png';
 import { Button } from '@/components/ui/button';
 import { motion, type Variants } from 'framer-motion';
 import { useTheme } from '@/hooks/useTheme';
@@ -42,7 +42,7 @@ export function WelcomeScreen({ onGetStarted }: WelcomeScreenProps) {
         animate="visible"
       >
         <motion.div variants={itemVariants}>
-          <img src={mascot} alt="empanadash" className="h-24 w-24" />
+          <img src={icon} alt="empanadash" className="h-24 w-24 rounded-2xl" />
         </motion.div>
 
         <motion.h1
