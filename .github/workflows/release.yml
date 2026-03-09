@@ -261,7 +261,7 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes --latest || gh release edit "$TAG" --draft=false --prerelease=false
           fi
           # Upload Linux packages and metadata
-          FILES=(release/emdash-*.AppImage release/emdash-*.deb release/emdash-*.rpm)
+          FILES=(release/empanadash-*.AppImage release/empanadash-*.deb release/empanadash-*.rpm)
           if [ -f release/latest-linux.yml ]; then FILES+=(release/latest-linux.yml); fi
           gh release upload "$TAG" "${FILES[@]}" --clobber
 
@@ -399,8 +399,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $files = @()
-          $files += Get-ChildItem -Path release -Filter 'emdash-*.exe' -ErrorAction SilentlyContinue
-          $files += Get-ChildItem -Path release -Filter 'emdash-*.msi' -ErrorAction SilentlyContinue
+          $files += Get-ChildItem -Path release -Filter 'empanadash-*.exe' -ErrorAction SilentlyContinue
+          $files += Get-ChildItem -Path release -Filter 'empanadash-*.msi' -ErrorAction SilentlyContinue
           if ($files.Count -eq 0) {
             Write-Host "::error::No .exe or .msi files found in release/ to verify"
             exit 1
@@ -436,7 +436,7 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --generate-notes --latest || gh release edit "$TAG" --draft=false --prerelease=false
           fi
-          FILES=(release/emdash-*.exe release/emdash-*.msi)
+          FILES=(release/empanadash-*.exe release/empanadash-*.msi)
           if ls release/*.blockmap >/dev/null 2>&1; then FILES+=(release/*.blockmap); fi
           if [ -f release/latest.yml ]; then FILES+=(release/latest.yml); fi
           if [ -f release/latest-win.yml ]; then FILES+=(release/latest-win.yml); fi
@@ -448,8 +448,8 @@ jobs:
         with:
           name: WINDOWS-ARTIFACTS
           path: |
-            release/emdash-*.exe
-            release/emdash-*.msi
+            release/empanadash-*.exe
+            release/empanadash-*.msi
             release/*.blockmap
             release/latest*.yml
           if-no-files-found: error
@@ -700,8 +700,8 @@ jobs:
               if [ -z "$BID" ]; then
                 BID=$(plutil -extract CFBundleIdentifier xml1 -o - "$PLIST" 2>/dev/null | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p' | head -n1)
               fi
-              if [ "$BID" != "com.emdash" ]; then
-                echo "::error::CFBundleIdentifier mismatch (got '$BID', expected 'com.emdash')"; exit 1
+              if [ "$BID" != "com.empanadash" ]; then
+                echo "::error::CFBundleIdentifier mismatch (got '$BID', expected 'com.empanadash')"; exit 1
               fi
               # Ensure packaged resources exist (prevents white-screen adhoc shells)
               if [ ! -f "$APP/Contents/Resources/app.asar" ] && [ ! -d "$APP/Contents/Resources/app" ]; then
@@ -788,7 +788,7 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes --latest || gh release edit "$TAG" --draft=false --prerelease=false
           fi
           # Upload stapled DMGs, ZIPs (for auto-update), and update files
-          FILES=(release/emdash-*.dmg release/emdash-*.zip)
+          FILES=(release/empanadash-*.dmg release/empanadash-*.zip)
           if ls release/*.blockmap >/dev/null 2>&1; then FILES+=(release/*.blockmap); fi
           if [ -f release/latest-mac.yml ]; then FILES+=(release/latest-mac.yml); fi
           gh release upload "$TAG" "${FILES[@]}" --clobber
@@ -800,8 +800,8 @@ jobs:
           echo "Contents of release/:"
           ls -lah release || true
           echo "Find DMGs:"
-          find release -maxdepth 1 -type f -name 'emdash-*.dmg' -print
-          DMG_COUNT=$(find release -maxdepth 1 -type f -name 'emdash-*.dmg' | wc -l | tr -d ' ')
+          find release -maxdepth 1 -type f -name 'empanadash-*.dmg' -print
+          DMG_COUNT=$(find release -maxdepth 1 -type f -name 'empanadash-*.dmg' | wc -l | tr -d ' ')
           if [ "$DMG_COUNT" -eq 0 ]; then
             echo "::error::No DMG files found in release/."; exit 1
           fi
@@ -811,7 +811,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SIGNED-STAPLED-DMGS
-          path: release/emdash-*.dmg
+          path: release/empanadash-*.dmg
           if-no-files-found: error
 
       - name: Upload supplemental files (blockmaps/yml) (dry-run)
