@@ -122,6 +122,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ onClose, onCreateTask }) => {
   const [touched, setTouched] = useState(false);
   const [isFocused, setIsFocused] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
+  const [creatingStep, setCreatingStep] = useState<string | null>(null);
 
   // Advanced settings state
   const [initialPrompt, setInitialPrompt] = useState('');
@@ -156,6 +157,15 @@ const TaskModal: React.FC<TaskModalProps> = ({ onClose, onCreateTask }) => {
   const customNameTrackedRef = useRef(false);
   // True when the name was derived from context (prompt/issue) — already descriptive
   const nameFromContextRef = useRef(false);
+
+  // Listen for real progress events from the main process during worktree creation
+  useEffect(() => {
+    if (!isCreating) return;
+    const cleanup = window.electronAPI.onWorktreeCreateProgress(({ step }) => {
+      setCreatingStep(step);
+    });
+    return cleanup;
+  }, [isCreating]);
 
   // Integration connections — always active since component only mounts when open
   const integrations = useIntegrationStatus(true);
@@ -342,6 +352,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ onClose, onCreateTask }) => {
     // it's already descriptive — don't mark it for post-creation rename.
 
     setIsCreating(true);
+    setCreatingStep(null);
 
     try {
       await onCreateTask(
@@ -471,7 +482,7 @@ const TaskModal: React.FC<TaskModalProps> = ({ onClose, onCreateTask }) => {
             {isCreating ? (
               <>
                 <Spinner size="sm" className="mr-2" />
-                Creating…
+                {creatingStep || 'Creating…'}
               </>
             ) : (
               'Create'

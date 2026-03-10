@@ -167,6 +167,8 @@ declare global {
         error?: string;
       }>;
 
+      onWorktreeCreateProgress: (listener: (data: { step: string }) => void) => () => void;
+
       // Worktree management
       worktreeCreate: (args: {
         projectPath: string;
@@ -1275,6 +1277,8 @@ export interface ElectronAPI {
     listener: (event: AgentEvent, meta: { appFocused: boolean }) => void
   ) => () => void;
   onNotificationFocusTask: (listener: (taskId: string) => void) => () => void;
+
+  onWorktreeCreateProgress: (listener: (data: { step: string }) => void) => () => void;
 
   // Worktree management
   worktreeCreate: (args: {
