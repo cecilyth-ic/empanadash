@@ -731,6 +731,18 @@ const ChatInterface: React.FC<Props> = ({
       const { agentName, tmuxSocket, paneId } = ev.payload ?? {};
       if (!tmuxSocket || !paneId) return;
 
+      // Deduplicate: skip if a tab for this pane already exists (can happen
+      // when both global and project-level PostToolUse hooks fire).
+      const alreadyExists = conversations.some((c) => {
+        try {
+          const m = c.metadata ? JSON.parse(c.metadata) : null;
+          return m?.type === 'teammate' && m?.paneId === paneId;
+        } catch {
+          return false;
+        }
+      });
+      if (alreadyExists) return;
+
       try {
         const meta = JSON.stringify({ type: 'teammate', tmuxSocket, paneId });
         const newConv = await rpc.db.createConversation({
@@ -752,7 +764,7 @@ const ChatInterface: React.FC<Props> = ({
     };
     window.addEventListener('emdash:teammate-spawn', handleTeammateSpawn);
     return () => window.removeEventListener('emdash:teammate-spawn', handleTeammateSpawn);
-  }, [task.id]);
+  }, [task.id, conversations]);
 
   // Auto-close teammate tabs when their agent's PTY exits (i.e. the agent finished).
   // We register per-PTY listeners for all teammate conversations so the tab closes
