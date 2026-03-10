@@ -221,15 +221,15 @@ export class RemoteGitService {
   async getDefaultBranch(connectionId: string, projectPath: string): Promise<string> {
     const cwd = this.normalizeRemotePath(projectPath);
 
-    // Single script: try current branch, then common names
+    // Single script: try origin's symbolic HEAD, then common remote-tracking refs, then local
     const script = [
-      'b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)',
-      'if [ -n "$b" ] && [ "$b" != "HEAD" ]; then echo "$b"; exit 0; fi',
-      'for name in main master develop trunk; do',
+      'db=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)',
+      'if [ -n "$db" ]; then echo "$db"; exit 0; fi',
+      'for name in origin/main origin/master main master; do',
       '  if git rev-parse --verify "$name" >/dev/null 2>&1; then echo "$name"; exit 0; fi',
       'done',
       'echo HEAD',
-    ].join('; ');
+    ].join('\n');
 
     const result = await this.exec(connectionId, script, cwd);
     return (result.stdout || 'HEAD').trim();
@@ -239,11 +239,12 @@ export class RemoteGitService {
     connectionId: string,
     projectPath: string,
     taskName: string,
-    baseRef?: string
+    baseRef?: string,
+    onProgress?: (step: string) => void
   ): Promise<WorktreeInfo> {
     return withTimeout(
-      this._createWorktreeImpl(connectionId, projectPath, taskName, baseRef),
-      60_000,
+      this._createWorktreeImpl(connectionId, projectPath, taskName, baseRef, onProgress),
+      120_000,
       'createWorktree'
     );
   }
@@ -252,7 +253,8 @@ export class RemoteGitService {
     connectionId: string,
     projectPath: string,
     taskName: string,
-    baseRef?: string
+    baseRef?: string,
+    onProgress?: (step: string) => void
   ): Promise<WorktreeInfo> {
     const implStart = Date.now();
     log.info(`[RemoteGitService] _createWorktreeImpl start: task=${taskName}, baseRef=${baseRef}`);
@@ -269,6 +271,7 @@ export class RemoteGitService {
     // Determine base ref with one round trip (or zero if provided and valid)
     let base = (baseRef || '').trim();
     log.info(`[RemoteGitService] _createWorktreeImpl: verifying base ref "${base}"`);
+    onProgress?.('Resolving branch…');
     if (base) {
       const verifyResult = await this.exec(
         connectionId,
@@ -290,41 +293,95 @@ export class RemoteGitService {
       `[RemoteGitService] _createWorktreeImpl: using base="${base}" (elapsed ${Date.now() - implStart}ms)`
     );
 
-    // Single batched script: mkdir, cleanup stale branch, create worktree, sparse-checkout
+    // Detect git root and relative project subdir for graft support
+    onProgress?.('Detecting repository structure…');
+    const gitRootResult = await this.exec(
+      connectionId,
+      'git rev-parse --show-toplevel',
+      normalizedProjectPath
+    );
+    const gitRoot =
+      gitRootResult.exitCode === 0 ? gitRootResult.stdout.trim() : normalizedProjectPath;
+    // Compute relative subdir (e.g., "customers/customers-backend") for graft
+    const projectSubdir = normalizedProjectPath.startsWith(gitRoot)
+      ? normalizedProjectPath.slice(gitRoot.length).replace(/^\//, '')
+      : '';
+
+    log.info(
+      `[RemoteGitService] _createWorktreeImpl: gitRoot=${gitRoot}, projectSubdir=${projectSubdir}`
+    );
+
+    // Single batched script: try graft first, fall back to plain git worktree.
+    // The script echoes "WORKTREE_PATH=<path>" on the last line so we can parse
+    // the actual worktree location (graft creates worktrees in its own directory).
     const script = [
-      // Ensure worktrees directory exists
-      'mkdir -p .emdash/worktrees',
       // Clean up stale branch from prior failed attempt (if any)
       `if git rev-parse --verify refs/heads/${quoteShellArg(worktreeName)} >/dev/null 2>&1; then`,
-      `  rm -rf ${quoteShellArg(relWorktreePath)}`,
-      '  git worktree prune',
+      `  rm -rf ${quoteShellArg(relWorktreePath)} 2>/dev/null`,
+      '  git worktree prune 2>/dev/null',
       `  git branch -D ${quoteShellArg(worktreeName)} 2>/dev/null`,
       'fi',
-      // Create worktree with --no-checkout (repos can have 500K+ files)
-      `git worktree add --no-checkout ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(base)}`,
-      // Enable sparse-checkout in cone mode
-      `cd ${quoteShellArg(worktreePath)} && git sparse-checkout init --cone`,
+      // Detect graft — check common install paths since non-interactive SSH may not have full PATH.
+      'GRAFT_BIN=$(command -v graft 2>/dev/null || true)',
+      'if [ -z "$GRAFT_BIN" ]; then for p in "$HOME/.config/gohan/bin/graft" "$HOME/.local/bin/graft" "$HOME/bin/graft" "$HOME/go/bin/graft" "/usr/local/bin/graft"; do [ -x "$p" ] && GRAFT_BIN="$p" && break; done; fi',
+      // Use graft for monorepos (handles sparse checkout automatically), fall back to plain git worktree.
+      `if [ -n "$GRAFT_BIN" ] && [ -n ${quoteShellArg(projectSubdir)} ]; then`,
+      '  echo "EMDASH_USING_GRAFT=true"',
+      `  cd ${quoteShellArg(gitRoot)}`,
+      // Graft prefixes branch names (e.g. with $GITHUB_USERNAME/) and places
+      // worktrees at ~/grafts/<repo>/<name>, so we parse its --verbose output for the path.
+      `  GRAFT_OUTPUT=$("$GRAFT_BIN" new ${quoteShellArg(worktreeName)} ${quoteShellArg(projectSubdir)} --sparse --from ${quoteShellArg(base)} --no-setup --verbose --quiet 2>&1)`,
+      // Parse worktree root from graft verbose output: "Worktree path: /home/bento/grafts/carrot/<name>"
+      '  GRAFT_WTROOT=$(echo "$GRAFT_OUTPUT" | grep -o "Worktree path: .*" | sed "s/Worktree path: //" | head -1)',
+      // Fallback: search git worktree list for any entry containing our branch name
+      `  if [ -z "$GRAFT_WTROOT" ]; then`,
+      `    GRAFT_WTROOT=$(git worktree list | grep '${worktreeName}' | awk '{print $1}')`,
+      '  fi',
+      `  if [ -n "$GRAFT_WTROOT" ]; then`,
+      `    WPATH="$GRAFT_WTROOT"/${quoteShellArg(projectSubdir)}`,
+      '  else',
+      `    WPATH=${quoteShellArg(worktreePath)}`,
+      '  fi',
+      'else',
+      '  mkdir -p .emdash/worktrees',
+      `  git worktree add ${quoteShellArg(relWorktreePath)} -b ${quoteShellArg(worktreeName)} ${quoteShellArg(base)}`,
+      `  WPATH=${quoteShellArg(worktreePath)}`,
+      'fi',
       // Enable git optimizations for faster status queries
-      `cd ${quoteShellArg(worktreePath)} && git config core.fsmonitor true && git config core.untrackedCache true`,
+      'cd "$WPATH" && git config core.fsmonitor true && git config core.untrackedCache true 2>/dev/null || true',
+      'echo "WORKTREE_PATH=$WPATH"',
     ].join('\n');
 
     log.info(
       `[RemoteGitService] _createWorktreeImpl: running batched create script (elapsed ${Date.now() - implStart}ms)`
     );
+    onProgress?.(projectSubdir ? 'Creating worktree with sparse checkout…' : 'Creating worktree…');
+
     const result = await this.exec(connectionId, script, normalizedProjectPath);
+
+    const scriptOutput = (result.stdout || '').trim();
+    const usingGraft = scriptOutput.includes('EMDASH_USING_GRAFT=true');
+    log.info(
+      `[RemoteGitService] _createWorktreeImpl: usingGraft=${usingGraft} (elapsed ${Date.now() - implStart}ms)`
+    );
 
     if (result.exitCode !== 0) {
       log.error(
-        `[RemoteGitService] _createWorktreeImpl: FAILED after ${Date.now() - implStart}ms: ${result.stdout}`
+        `[RemoteGitService] _createWorktreeImpl: FAILED after ${Date.now() - implStart}ms: ${scriptOutput}`
       );
-      throw new Error(`Failed to create worktree: ${result.stdout}`);
+      throw new Error(`Failed to create worktree: ${scriptOutput}`);
     }
 
+    // Parse the actual worktree path from script output
+    const pathMatch = scriptOutput.match(/WORKTREE_PATH=(.+)/);
+    const actualWorktreePath = pathMatch ? pathMatch[1].trim() : worktreePath;
+    onProgress?.('Finalizing…');
+
     log.info(
-      `[RemoteGitService] _createWorktreeImpl: SUCCESS in ${Date.now() - implStart}ms, path=${worktreePath}`
+      `[RemoteGitService] _createWorktreeImpl: SUCCESS in ${Date.now() - implStart}ms, path=${actualWorktreePath}`
     );
     return {
-      path: worktreePath,
+      path: actualWorktreePath,
       branch: worktreeName,
       isMain: false,
     };

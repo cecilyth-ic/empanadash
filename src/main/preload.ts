@@ -192,6 +192,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener(channel, wrapped);
   },
 
+  // Worktree progress events (streamed from main during remote worktree creation)
+  onWorktreeCreateProgress: (listener: (data: { step: string }) => void) => {
+    const channel = 'worktree:create-progress';
+    const wrapped = (_: Electron.IpcRendererEvent, data: { step: string }) => listener(data);
+    ipcRenderer.on(channel, wrapped);
+    return () => ipcRenderer.removeListener(channel, wrapped);
+  },
+
   // Worktree management
   worktreeCreate: (args: {
     projectPath: string;

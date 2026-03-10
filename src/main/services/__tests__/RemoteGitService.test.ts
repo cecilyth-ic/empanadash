@@ -137,7 +137,7 @@ describe('RemoteGitService', () => {
         expect.stringContaining('git rev-parse --abbrev-ref HEAD'),
         '/home/user/project'
       );
-      // createWorktree: single batched script with mkdir + worktree add + sparse-checkout
+      // createWorktree: single batched script with mkdir + worktree add
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
         expect.stringContaining('git worktree add'),

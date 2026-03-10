@@ -936,12 +936,15 @@ export function useTaskManagement() {
     setIsCreatingTask(false);
   }, []);
 
-  // Clear isCreatingTask as soon as activeTask arrives — the task was created successfully.
+  // Clear isCreatingTask once the REAL task arrives (not the optimistic placeholder).
   // Without this, the exclusive rendering in MainContentArea creates a deadlock:
   // isCreatingTask=true → TaskCreationLoading renders → ChatInterface never mounts →
   // onTaskInterfaceReady never fires → isCreatingTask never clears.
+  // We skip optimistic tasks (id starts with "optimistic-") to avoid mounting
+  // ChatInterface prematurely with the project path instead of the worktree path,
+  // which would trigger expensive status polling on the wrong path.
   useEffect(() => {
-    if (isCreatingTask && activeTask) {
+    if (isCreatingTask && activeTask && !activeTask.id.startsWith('optimistic-')) {
       setIsCreatingTask(false);
     }
   }, [isCreatingTask, activeTask]);

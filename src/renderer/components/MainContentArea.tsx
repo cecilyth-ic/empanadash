@@ -103,7 +103,13 @@ const MainContentArea: React.FC<MainContentAreaProps> = ({
     return (
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         {isCreatingTask ? (
-          <TaskCreationLoading />
+          <TaskCreationLoading
+            isRemote={
+              !!selectedProject.isRemote ||
+              !!selectedProject.sshConnectionId ||
+              !!projectRemoteConnectionId
+            }
+          />
         ) : activeTask ? (
           (activeTask.metadata as any)?.multiAgent?.enabled ? (
             <MultiAgentTask

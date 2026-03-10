@@ -83,11 +83,23 @@ export function registerWorktreeIpc(): void {
             project.sshConnectionId,
             project.remotePath,
             args.taskName,
-            baseRef
+            baseRef,
+            (step: string) => {
+              try {
+                event.sender.send('worktree:create-progress', { step });
+              } catch {
+                // sender may be destroyed if window closed during creation
+              }
+            }
           );
           log.info(
             `[worktreeIpc] worktree:create (remote) createWorktree completed in ${Date.now() - createStart}ms`
           );
+          try {
+            event.sender.send('worktree:create-progress', { step: 'Saving task…' });
+          } catch {
+            /* sender may be destroyed */
+          }
           const worktree = {
             id: stableIdFromRemotePath(remote.path),
             name: args.taskName,
