@@ -131,13 +131,19 @@ describe('RemoteGitService', () => {
 
       const result = await service.createWorktree('conn-1', '/home/user/project', 'task name');
 
-      // getDefaultBranch: single batched script
+      // getDefaultBranch: checks origin/HEAD then common refs
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
-        expect.stringContaining('git rev-parse --abbrev-ref HEAD'),
+        expect.stringContaining('symbolic-ref'),
         '/home/user/project'
       );
-      // createWorktree: single batched script with mkdir + worktree add
+      // git root detection
+      expect(mockExecuteCommand).toHaveBeenCalledWith(
+        'conn-1',
+        'git rev-parse --show-toplevel',
+        '/home/user/project'
+      );
+      // createWorktree: single batched script with worktree add
       expect(mockExecuteCommand).toHaveBeenCalledWith(
         'conn-1',
         expect.stringContaining('git worktree add'),
@@ -193,7 +199,12 @@ describe('RemoteGitService', () => {
 
     it('should throw error when worktree creation fails', async () => {
       mockExecuteCommand
-        .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch (batched)
+        .mockResolvedValueOnce({ stdout: 'main', stderr: '', exitCode: 0 } as ExecResult) // getDefaultBranch
+        .mockResolvedValueOnce({
+          stdout: '/home/user/project',
+          stderr: '',
+          exitCode: 0,
+        } as ExecResult) // git root
         .mockResolvedValueOnce({
           stdout: 'fatal: A branch named "test" already exists',
           stderr: '',
